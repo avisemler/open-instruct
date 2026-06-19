@@ -85,7 +85,8 @@ def _probe_register_hooks(model) -> dict:
     def _make_hook(idx: int):
         def _hook(_mod, _inp, out):
             hidden = out[0] if isinstance(out, (tuple, list)) else out
-            sys._probe_store[idx] = hidden[0, 0, :].detach().cpu()
+            # vLLM packs sequences as [num_tokens, hidden_dim] (no batch dim).
+            sys._probe_store[idx] = hidden[0, :].detach().cpu()
         return _hook
 
     for i, layer in enumerate(layers):
@@ -110,7 +111,7 @@ def _probe_remove_hooks(model) -> None:
 
 
 def _print_activation_summary(store: dict) -> None:
-    logger.info(f"Linear-probe activations — {len(store)} layers (first token, last forward pass):")
+    logger.info(f"Linear-probe activations — {len(store)} layers (token[0] of packed batch, last forward pass):")
     for idx in sorted(store):
         act = store[idx]
         logger.info(
@@ -247,6 +248,10 @@ def generate_with_vllm(
 
     max_model_len = streaming_config.max_prompt_token_length + streaming_config.response_length
 
+    if linear_probe:
+        # Must be set before the engine-core subprocess is spawned so it inherits the flag.
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
     logger.info(f"Loading {model_name_or_path} with vLLM (max_model_len={max_model_len})...")
     llm = vllm.LLM(
         model=model_name_or_path,
@@ -286,9 +291,8 @@ def generate_with_vllm(
                 "Linear probe hooks require eager execution (CUDA graphs bypass Python hooks). "
                 "Pass --vllm_enforce_eager; activations may be absent without it."
             )
-        # apply_model serialises the callable via pickle; vLLM 0.19 requires this opt-in.
-        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-        info = llm.llm_engine.apply_model(_probe_register_hooks)
+        # collective_rpc returns a list (one result per worker); unpack the single TP=1 result.
+        info = llm.llm_engine.apply_model(_probe_register_hooks)[0]
         if "error" in info:
             logger.warning(f"Linear probe setup failed: {info['error']}")
         else:
@@ -300,7 +304,7 @@ def generate_with_vllm(
     outputs = llm.generate(inputs, sampling_params=sampling_params)
 
     if linear_probe:
-        activation_store = llm.llm_engine.apply_model(_probe_read_activations)
+        activation_store = llm.llm_engine.apply_model(_probe_read_activations)[0]
         if activation_store:
             _print_activation_summary(activation_store)
         else:

@@ -58,6 +58,68 @@ from open_instruct.ground_truth_utils import apply_verifiable_reward, build_all_
 
 logger = logger_utils.setup_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Activation-hook helpers (used by the linear-probe code path)
+# ---------------------------------------------------------------------------
+
+def _probe_register_hooks(model) -> dict:
+    """Register forward hooks on decoder layers; runs inside the vLLM engine-core process.
+
+    vLLM 0.19+ executes the model in a separate subprocess. apply_model() serialises
+    this function and runs it there. We persist handles and activations in sys attributes
+    so subsequent apply_model calls can read / remove them.
+    """
+    import sys
+
+    sys._probe_store: dict = {}
+    sys._probe_handles: list = []
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = list(model.model.layers)
+    elif hasattr(model, "layers"):
+        layers = list(model.layers)
+    else:
+        return {"n_layers": 0, "model_type": type(model).__name__, "error": "no decoder layers found"}
+
+    def _make_hook(idx: int):
+        def _hook(_mod, _inp, out):
+            hidden = out[0] if isinstance(out, (tuple, list)) else out
+            sys._probe_store[idx] = hidden[0, 0, :].detach().cpu()
+        return _hook
+
+    for i, layer in enumerate(layers):
+        sys._probe_handles.append(layer.register_forward_hook(_make_hook(i)))
+
+    return {"n_layers": len(layers), "model_type": type(model).__name__}
+
+
+def _probe_read_activations(model) -> dict:
+    """Return stored activations; runs inside the vLLM engine-core process."""
+    import sys
+    return dict(getattr(sys, "_probe_store", {}))
+
+
+def _probe_remove_hooks(model) -> None:
+    """Remove hooks and clear state; runs inside the vLLM engine-core process."""
+    import sys
+    for h in getattr(sys, "_probe_handles", []):
+        h.remove()
+    sys._probe_handles = []
+    sys._probe_store = {}
+
+
+def _print_activation_summary(store: dict) -> None:
+    logger.info(f"Linear-probe activations — {len(store)} layers (first token, last forward pass):")
+    for idx in sorted(store):
+        act = store[idx]
+        logger.info(
+            f"  layer {idx:3d} | shape {list(act.shape)} | "
+            f"mean {act.mean().item():+.4f} | std {act.std().item():.4f} | "
+            f"first_5: {[round(v, 4) for v in act[:5].tolist()]}"
+        )
+
+
 # Dolci-Think-RL-7B has 6 raw category labels that map to 4 logical groups.
 DOLCI_CATEGORY_GROUPS: dict[str, list[str]] = {
     "math": ["math"],
@@ -80,7 +142,7 @@ def get_or_create_dolci_subset(
     """
     if path and os.path.exists(path):
         logger.info(f"Loading Dolci subset from {path}")
-        return Dataset.load_from_disk(path)
+        return Dataset.load_from_disk(path).shuffle(seed=seed)
 
     logger.info(f"Dolci subset not found at {path!r} — creating from full dataset...")
     full = load_dataset("allenai/Dolci-Think-RL-7B", split="train")
@@ -158,6 +220,7 @@ def score_completions(
                 "dataset": dataset_names[i],
             }
         )
+
     return results
 
 
@@ -169,6 +232,7 @@ def generate_with_vllm(
     streaming_config: data_loader_lib.StreamingDataLoaderConfig,
     vllm_config: data_loader_lib.VLLMConfig,
     seed: int,
+    linear_probe: bool = False,
 ) -> list[dict]:
     """Generate completions using vLLM (single GPU, no Ray).
 
@@ -215,7 +279,35 @@ def generate_with_vllm(
         f"max_tokens={streaming_config.response_length}, "
         f"stop={streaming_config.stop_strings})..."
     )
+
+    if linear_probe:
+        if not vllm_config.vllm_enforce_eager:
+            logger.warning(
+                "Linear probe hooks require eager execution (CUDA graphs bypass Python hooks). "
+                "Pass --vllm_enforce_eager; activations may be absent without it."
+            )
+        # apply_model serialises the callable via pickle; vLLM 0.19 requires this opt-in.
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+        info = llm.llm_engine.apply_model(_probe_register_hooks)
+        if "error" in info:
+            logger.warning(f"Linear probe setup failed: {info['error']}")
+        else:
+            logger.info(
+                f"Linear probe: hooks registered on {info['n_layers']} decoder layers "
+                f"of {info['model_type']} (inside engine-core process)."
+            )
+
     outputs = llm.generate(inputs, sampling_params=sampling_params)
+
+    if linear_probe:
+        activation_store = llm.llm_engine.apply_model(_probe_read_activations)
+        if activation_store:
+            _print_activation_summary(activation_store)
+        else:
+            logger.warning(
+                "Linear probe: no activations captured — try --vllm_enforce_eager to disable CUDA graphs."
+            )
+        llm.llm_engine.apply_model(_probe_remove_hooks)
 
     completions = []
     for i, request_output in enumerate(outputs):
@@ -357,6 +449,7 @@ def main(
             streaming_config=streaming_config,
             vllm_config=vllm_config,
             seed=args.seed,
+            linear_probe=script_args.linear_probe,
         )
     elif script_args.generate_with_transformers:
         if script_args.model_name_or_path is None:
@@ -400,6 +493,15 @@ if __name__ == "__main__":
     parser.add_argument("--completions_jsonl", type=str, default=None)
     parser.add_argument("--generate_with_vllm", action="store_true")
     parser.add_argument("--generate_with_transformers", action="store_true")
+    parser.add_argument(
+        "--linear_probe",
+        action="store_true",
+        help=(
+            "Attach forward hooks to every decoder layer during vLLM generation and print "
+            "the first-token hidden-state summary (mean, std, first 5 values) for each layer. "
+            "Requires --generate_with_vllm. Use --vllm_enforce_eager to ensure hooks fire."
+        ),
+    )
     # Optional: doubles as tokenizer source when --tokenizer_name_or_path is absent
     parser.add_argument("--model_name_or_path", type=str, default=None)
     parser.add_argument("--max_examples", type=int, default=100)
@@ -454,6 +556,12 @@ if __name__ == "__main__":
         pack_length=10_000_000,
         dataset_mixer_list=["allenai/Dolci-Think-RL-7B", "1.0"],
         dataset_mixer_list_splits=["train"],
+        # For Olmo 3 7B think models at RL/eval stages, use olmo_thinker which adds
+        # <think> to add_generation_prompt so the model starts and closes thinking correctly.
+        # See docs/olmo3.md: think evaluation and post-SFT stages use olmo-3.2-tokenizer-think-dev.
+        chat_template_name="olmo_thinker",
+        filter_zero_std_samples=False,
+        system_prompt_override_file="scripts/train/qwen/math_system_prompt.txt"
     )
     args, tc, streaming_config, vllm_config, tools_config = oi_parser.parse_args_into_dataclasses()
 

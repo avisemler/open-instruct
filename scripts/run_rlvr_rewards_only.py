@@ -63,6 +63,7 @@ logger = logger_utils.setup_logger(__name__)
 # Activation-hook helpers (used by the linear-probe code path)
 # ---------------------------------------------------------------------------
 
+
 def _probe_register_hooks(model) -> dict:
     """Register forward hooks on decoder layers; runs inside the vLLM engine-core process.
 
@@ -70,7 +71,7 @@ def _probe_register_hooks(model) -> dict:
     this function and runs it there. We persist handles and activations in sys attributes
     so subsequent apply_model calls can read / remove them.
     """
-    import sys
+    import sys  # noqa: PLC0415
 
     sys._probe_store: dict = {}
     sys._probe_handles: list = []
@@ -87,6 +88,7 @@ def _probe_register_hooks(model) -> dict:
             hidden = out[0] if isinstance(out, (tuple, list)) else out
             # vLLM packs sequences as [num_tokens, hidden_dim] (no batch dim).
             sys._probe_store[idx] = hidden[0, :].detach().cpu()
+
         return _hook
 
     for i, layer in enumerate(layers):
@@ -97,17 +99,51 @@ def _probe_register_hooks(model) -> dict:
 
 def _probe_read_activations(model) -> dict:
     """Return stored activations; runs inside the vLLM engine-core process."""
-    import sys
+    import sys  # noqa: PLC0415
+
     return dict(getattr(sys, "_probe_store", {}))
 
 
 def _probe_remove_hooks(model) -> None:
     """Remove hooks and clear state; runs inside the vLLM engine-core process."""
-    import sys
+    import sys  # noqa: PLC0415
+
     for h in getattr(sys, "_probe_handles", []):
         h.remove()
     sys._probe_handles = []
     sys._probe_store = {}
+
+
+def _probe_register_hooks_collect(model) -> dict:
+    """Like _probe_register_hooks but stores the FULL hidden tensor on every forward pass.
+
+    After a generation run with max_tokens=1 on N prompts, the last stored tensor comes
+    from the single decode step and has shape [N, hidden_dim], where index i corresponds
+    to the i-th concurrently-decoded sequence.
+    """
+    import sys  # noqa: PLC0415
+
+    sys._probe_store: dict = {}
+    sys._probe_handles: list = []
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = list(model.model.layers)
+    elif hasattr(model, "layers"):
+        layers = list(model.layers)
+    else:
+        return {"n_layers": 0, "model_type": type(model).__name__, "error": "no decoder layers found"}
+
+    def _make_hook(idx: int):
+        def _hook(_mod, _inp, out):
+            hidden = out[0] if isinstance(out, (tuple, list)) else out
+            sys._probe_store[idx] = hidden.detach().cpu()  # full tensor, not just token[0]
+
+        return _hook
+
+    for i, layer in enumerate(layers):
+        sys._probe_handles.append(layer.register_forward_hook(_make_hook(i)))
+
+    return {"n_layers": len(layers), "model_type": type(model).__name__}
 
 
 def _print_activation_summary(store: dict) -> None:
@@ -121,6 +157,65 @@ def _print_activation_summary(store: dict) -> None:
         )
 
 
+def score_prompts_with_probe_vllm(
+    llm, prompt_input_ids: list[list[int]], probe_directions: dict[int, torch.Tensor]
+) -> list[dict[int, float]]:
+    """Score prompts against a contrastive probe using the already-loaded vLLM engine.
+
+    Runs each prompt through vLLM with max_tokens=1 (prefill + one decode step) using
+    ``_probe_register_hooks_collect`` hooks.  The last forward pass is always the decode
+    step; for N concurrently-decoded sequences its hidden tensor has shape [N, hidden_dim].
+
+    Returns a list of dicts mapping layer_idx → probe score (dot product with unit-norm
+    direction).  Returns an empty dict per example if the activation shape is unexpected.
+    """
+    import vllm  # noqa: PLC0415
+
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    n = len(prompt_input_ids)
+    logger.info(f"Scoring {n} prompts with contrastive probe via vLLM (max_tokens=1)...")
+
+    info = llm.llm_engine.apply_model(_probe_register_hooks_collect)[0]
+    if "error" in info:
+        logger.warning(f"Probe scoring: hook registration failed — {info['error']}")
+        return [{} for _ in prompt_input_ids]
+
+    score_params = vllm.SamplingParams(temperature=0.0, max_tokens=1)
+    inputs = [{"prompt_token_ids": list(ids)} for ids in prompt_input_ids]
+    llm.generate(inputs, sampling_params=score_params)
+
+    store = llm.llm_engine.apply_model(_probe_read_activations)[0]
+    llm.llm_engine.apply_model(_probe_remove_hooks)
+
+    if not store:
+        logger.warning("Probe scoring: no activations captured (try --vllm_enforce_eager).")
+        return [{} for _ in prompt_input_ids]
+
+    # Verify shape matches expected number of examples
+    sample_layer = next(iter(sorted(store)))
+    act_shape = store[sample_layer].shape
+    if act_shape[0] != n:
+        logger.warning(
+            f"Probe scoring: decode tensor has {act_shape[0]} rows but expected {n}. "
+            "vLLM may have batched decode differently — returning empty scores."
+        )
+        return [{} for _ in prompt_input_ids]
+
+    scores: list[dict[int, float]] = []
+    for i in range(n):
+        per_example: dict[int, float] = {}
+        for layer_idx, direction in probe_directions.items():
+            if layer_idx not in store:
+                continue
+            hidden = store[layer_idx][i, :].float()
+            per_example[layer_idx] = torch.dot(hidden, direction.float()).item()
+        scores.append(per_example)
+
+    logger.info(f"Probe scoring complete for {n} examples.")
+    return scores
+
+
 # Dolci-Think-RL-7B has 6 raw category labels that map to 4 logical groups.
 DOLCI_CATEGORY_GROUPS: dict[str, list[str]] = {
     "math": ["math"],
@@ -130,11 +225,7 @@ DOLCI_CATEGORY_GROUPS: dict[str, list[str]] = {
 }
 
 
-def get_or_create_dolci_subset(
-    path: str,
-    n_per_category: int = 200,
-    seed: int = 42,
-) -> Dataset:
+def get_or_create_dolci_subset(path: str, n_per_category: int = 200, seed: int = 42) -> Dataset:
     """Load a small balanced Dolci subset from disk, creating it first if absent.
 
     Samples ``n_per_category`` examples from each of the four merged categories
@@ -183,10 +274,7 @@ def load_completions_jsonl(path: str) -> list[dict]:
 
 
 def score_completions(
-    completions: list[dict],
-    dataset,
-    verifier_functions: dict,
-    verification_reward: float,
+    completions: list[dict], dataset, verifier_functions: dict, verification_reward: float
 ) -> list[dict]:
     """Score a list of {idx, completion} dicts against the dataset ground truths."""
     indices = [c["idx"] for c in completions]
@@ -234,7 +322,8 @@ def generate_with_vllm(
     vllm_config: data_loader_lib.VLLMConfig,
     seed: int,
     linear_probe: bool = False,
-) -> list[dict]:
+    return_llm: bool = False,
+) -> "list[dict] | tuple[list[dict], object]":
     """Generate completions using vLLM (single GPU, no Ray).
 
     Mirrors the sampling setup in grpo_fast.create_generation_configs():
@@ -243,8 +332,11 @@ def generate_with_vllm(
       - top_p = vllm_config.vllm_top_p
       - stop = streaming_config.stop_strings
       - n = streaming_config.num_samples_per_prompt_rollout
+
+    If ``return_llm=True``, returns ``(completions, llm)`` so the caller can reuse the
+    already-loaded vLLM engine (e.g. for on-the-fly probe scoring) without reloading.
     """
-    import vllm
+    import vllm  # noqa: PLC0415
 
     max_model_len = streaming_config.max_prompt_token_length + streaming_config.response_length
 
@@ -276,6 +368,7 @@ def generate_with_vllm(
     )
 
     n = min(max_examples, len(dataset))
+    # Shuffle the dataset to get a random sample of prompts if max_examples < dataset size
     inputs = [{"prompt_token_ids": list(dataset[i][INPUT_IDS_PROMPT_KEY])} for i in range(n)]
 
     logger.info(
@@ -308,9 +401,7 @@ def generate_with_vllm(
         if activation_store:
             _print_activation_summary(activation_store)
         else:
-            logger.warning(
-                "Linear probe: no activations captured — try --vllm_enforce_eager to disable CUDA graphs."
-            )
+            logger.warning("Linear probe: no activations captured — try --vllm_enforce_eager to disable CUDA graphs.")
         llm.llm_engine.apply_model(_probe_remove_hooks)
 
     completions = []
@@ -323,24 +414,17 @@ def generate_with_vllm(
     logger.info("Here are the first 5 completions:")
     for j, completion in enumerate(completions[:5]):
         logger.info(f"  {j + 1}: {completion['completion'][:300]}")
+    if return_llm:
+        return completions, llm
     return completions
 
 
 def generate_with_transformers(
-    dataset,
-    model_name_or_path: str,
-    tokenizer,
-    max_examples: int,
-    max_new_tokens: int,
-    temperature: float,
+    dataset, model_name_or_path: str, tokenizer, max_examples: int, max_new_tokens: int, temperature: float
 ) -> list[dict]:
     """Generate completions using a local HF transformers model."""
     logger.info(f"Loading model {model_name_or_path} for local generation...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto")
     model.eval()
     n = min(max_examples, len(dataset))
     completions = []
@@ -357,10 +441,10 @@ def generate_with_transformers(
                 do_sample=True,
                 top_k=50,
                 top_p=0.95,
-                #pad_token_id=tokenizer.eos_token_id,
+                # pad_token_id=tokenizer.eos_token_id,
             )
 
-        generated_ids = output[0]#[len(input_ids):]
+        generated_ids = output[0]  # [len(input_ids):]
         text = tokenizer.decode(generated_ids, skip_special_tokens=False)
         completions.append({"idx": i, "completion": text})
 
@@ -404,10 +488,9 @@ def _load_full_dataset(
     elif needs_tokenized_prompts:
         logger.info("Tokenizing dataset for generation mode...")
         train_dataset, _ = grpo_fast.setup_datasets(
-            args, tc, tokenizer, streaming_config,
-            tool_definitions=[], pass_tools_to_chat_template=False,
+            args, tc, tokenizer, streaming_config, tool_definitions=[], pass_tools_to_chat_template=False
         )
-        return train_dataset
+        return train_dataset.shuffle(seed=args.seed)
     else:
         # Scoring pre-computed completions only needs ground_truth + dataset columns.
         return raw_dataset
@@ -432,20 +515,21 @@ def main(
     logger.info("Loading dataset...")
     if script_args.dolci_subset_path is not None:
         train_dataset = get_or_create_dolci_subset(
-            path=script_args.dolci_subset_path,
-            n_per_category=script_args.dolci_subset_n_per_category,
-            seed=args.seed,
+            path=script_args.dolci_subset_path, n_per_category=script_args.dolci_subset_n_per_category, seed=args.seed
         )
     else:
         train_dataset = _load_full_dataset(script_args, args, tc, streaming_config, tokenizer)
+    train_dataset = train_dataset.shuffle(seed=args.seed)
     logger.info(f"Dataset loaded: {len(train_dataset)} examples")
 
     verifier_functions = build_all_verifiers(args, streaming_config)
 
+    llm_engine = None
     if script_args.generate_with_vllm:
         if script_args.model_name_or_path is None:
             raise ValueError("--model_name_or_path is required with --generate_with_vllm")
-        completions = generate_with_vllm(
+        need_llm_for_probe = script_args.probe_directions_path is not None
+        result = generate_with_vllm(
             dataset=train_dataset,
             model_name_or_path=script_args.model_name_or_path,
             tokenizer=tokenizer,
@@ -454,7 +538,12 @@ def main(
             vllm_config=vllm_config,
             seed=args.seed,
             linear_probe=script_args.linear_probe,
+            return_llm=need_llm_for_probe,
         )
+        if need_llm_for_probe:
+            completions, llm_engine = result
+        else:
+            completions = result
     elif script_args.generate_with_transformers:
         if script_args.model_name_or_path is None:
             raise ValueError("--model_name_or_path is required with --generate_with_transformers")
@@ -479,6 +568,52 @@ def main(
         verification_reward=int(streaming_config.verification_reward),
     )
 
+    if script_args.probe_directions_path is not None:
+        if llm_engine is None:
+            logger.warning(
+                "--probe_directions_path requires --generate_with_vllm to reuse the loaded model. "
+                "Skipping probe scoring."
+            )
+        else:
+            logger.info(f"Loading probe directions from {script_args.probe_directions_path}...")
+            probe_data = torch.load(script_args.probe_directions_path, weights_only=True)
+            directions: dict[int, torch.Tensor] = probe_data["directions"]
+
+            # Filter to requested layer indices
+            if script_args.probe_layer_indices:
+                requested = {int(x) for x in script_args.probe_layer_indices.split(",")}
+                directions = {k: v for k, v in directions.items() if k in requested}
+                logger.info(f"Probe: using layers {sorted(directions)}")
+            else:
+                logger.info(f"Probe: using all {len(directions)} layers from directions file")
+
+            # Gather unique prompt input_ids for each result (one prompt per unique idx)
+            seen_idx: set[int] = set()
+            unique_idx_order: list[int] = []
+            for r in results:
+                idx = r["idx"]
+                if idx not in seen_idx:
+                    seen_idx.add(idx)
+                    unique_idx_order.append(idx)
+            prompt_ids = [list(train_dataset[i][INPUT_IDS_PROMPT_KEY]) for i in unique_idx_order]
+            idx_to_probe_scores = {}
+
+            probe_scores_list = score_prompts_with_probe_vllm(llm_engine, prompt_ids, directions)
+            for idx, scores in zip(unique_idx_order, probe_scores_list):
+                idx_to_probe_scores[idx] = {str(k): v for k, v in scores.items()}
+
+            for r in results:
+                r["probe_scores"] = idx_to_probe_scores.get(r["idx"], {})
+
+            # Log aggregate stats per layer
+            layer_keys = sorted({k for scores in idx_to_probe_scores.values() for k in scores})
+            for lk in layer_keys:
+                vals = [idx_to_probe_scores[i][lk] for i in unique_idx_order if lk in idx_to_probe_scores[i]]
+                if vals:
+                    mean_v = sum(vals) / len(vals)
+                    std_v = (sum((v - mean_v) ** 2 for v in vals) / len(vals)) ** 0.5
+                    logger.info(f"  Probe layer {lk}: mean={mean_v:+.4f}, std={std_v:.4f}")
+
     logger.info(f"Writing {len(results)} results to {script_args.output_jsonl}...")
     with open(script_args.output_jsonl, "w") as f:
         for r in results:
@@ -487,8 +622,8 @@ def main(
     rewards = [r["reward"] for r in results]
     nonzero = sum(1 for r in rewards if r != 0)
     logger.info(
-        f"Done. Mean reward: {sum(rewards)/len(rewards):.4f}, "
-        f"Non-zero: {nonzero}/{len(rewards)} ({100*nonzero/len(rewards):.1f}%)"
+        f"Done. Mean reward: {sum(rewards) / len(rewards):.4f}, "
+        f"Non-zero: {nonzero}/{len(rewards)} ({100 * nonzero / len(rewards):.1f}%)"
     )
 
 
@@ -526,6 +661,26 @@ if __name__ == "__main__":
         type=int,
         default=200,
         help="Number of examples to sample per merged category when creating the Dolci subset.",
+    )
+    parser.add_argument(
+        "--probe_directions_path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a .pt file of cached contrastive probe directions produced by "
+            "scripts/cache_probe_directions.py. When set (with --generate_with_vllm), the "
+            "already-loaded vLLM model scores each task prompt against the probe and adds "
+            "'probe_scores' to the output JSONL. Requires --vllm_enforce_eager."
+        ),
+    )
+    parser.add_argument(
+        "--probe_layer_indices",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated layer indices to include in probe scoring "
+            "(e.g. '15,16,31'). Defaults to all layers stored in the directions file."
+        ),
     )
     script_args, remaining = parser.parse_known_args()
 
@@ -565,7 +720,7 @@ if __name__ == "__main__":
         # See docs/olmo3.md: think evaluation and post-SFT stages use olmo-3.2-tokenizer-think-dev.
         chat_template_name="olmo_thinker",
         filter_zero_std_samples=False,
-        system_prompt_override_file="scripts/train/qwen/math_system_prompt.txt"
+        system_prompt_override_file="scripts/train/qwen/math_system_prompt.txt",
     )
     args, tc, streaming_config, vllm_config, tools_config = oi_parser.parse_args_into_dataclasses()
 

@@ -48,6 +48,7 @@ dependencies = [
     # Provides the tilelang backend for fla's gated chunk_bwd_dqkwg, which fla routes to on
     # Hopper with Triton>=3.4.0 (the Triton kernel produces incorrect gradients there; see fla #640).
     "tilelang>=0.1.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "scikit-learn>=1.9.0",
 ]
 
 [build-system]

@@ -520,6 +520,7 @@ def main(
     else:
         train_dataset = _load_full_dataset(script_args, args, tc, streaming_config, tokenizer)
     train_dataset = train_dataset.shuffle(seed=args.seed)
+    print(f"Dataset columns: {train_dataset.column_names}")
     logger.info(f"Dataset loaded: {len(train_dataset)} examples")
 
     verifier_functions = build_all_verifiers(args, streaming_config)

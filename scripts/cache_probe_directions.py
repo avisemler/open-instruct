@@ -49,78 +49,16 @@ def _tokenize_messages(tokenizer, question: str, choice: str) -> list[int]:
     return tokenizer.apply_chat_template(messages, add_generation_prompt=False, return_dict=False)
 
 
-def _last_real_token_hidden(hidden_states: tuple, attention_mask: torch.Tensor) -> list[torch.Tensor]:
-    """Extract the hidden state at the last non-padding token for each example.
-
-    Returns a list of length n_layers, each a tensor of shape (batch, hidden_dim).
-    hidden_states[0] is the embedding layer; hidden_states[1:] are decoder layers.
-    """
-    batch_size = attention_mask.shape[0]
-    # Index of the last real (non-pad) token per example
-    last_indices = attention_mask.long().argmax(dim=1) + attention_mask.sum(dim=1) - 1
-    # Clamp to valid range
-    seq_len = attention_mask.shape[1]
-    last_indices = last_indices.clamp(0, seq_len - 1)
-
-    result = []
-    for hs in hidden_states[1:]:  # skip embedding layer
-        # hs: (batch, seq_len, hidden_dim)
-        selected = hs[torch.arange(batch_size, device=hs.device), last_indices]
-        result.append(selected.float().detach().cpu())
-    return result
-
-
 @torch.no_grad()
-def compute_probe_directions(model, tokenizer, prompts: list[dict], batch_size: int) -> dict[int, torch.Tensor]:
-    """Return a dict of layer_idx → unit-norm probe direction tensor."""
-    pos_hiddens: dict[int, list[torch.Tensor]] = {}
-    neg_hiddens: dict[int, list[torch.Tensor]] = {}
+def _extract_answer_hidden(token_ids: list[int], model) -> list[torch.Tensor]:
+    """Hidden state at the answer token (position -2, just before EOS) per decoder layer.
 
-    def _process_batch(batch_token_ids: list[list[int]], store: dict[int, list]):
-        # Left-pad so all sequences in the batch have the same length.
-        max_len = max(len(ids) for ids in batch_token_ids)
-        pad_id = tokenizer.pad_token_id or 0
-        input_ids_padded = torch.tensor(
-            [[pad_id] * (max_len - len(ids)) + ids for ids in batch_token_ids], dtype=torch.long
-        )
-        attention_mask = (input_ids_padded != pad_id).long()
-        input_ids_padded = input_ids_padded.to(model.device)
-        attention_mask = attention_mask.to(model.device)
-
-        outputs = model(input_ids=input_ids_padded, attention_mask=attention_mask, output_hidden_states=True)
-        # List of (batch, hidden_dim) tensors, one per decoder layer
-        per_layer = _last_real_token_hidden(outputs.hidden_states, attention_mask.cpu())
-        for layer_idx, h in enumerate(per_layer):
-            if layer_idx not in store:
-                store[layer_idx] = []
-            # h: (batch, hidden_dim) — split into per-example tensors
-            for example_h in h.unbind(dim=0):
-                store[layer_idx].append(example_h)
-
-    for polarity, store in [("positive", pos_hiddens), ("negative", neg_hiddens)]:
-        logger.info(f"Extracting {polarity} activations for {len(prompts)} prompts...")
-        batch_ids: list[list[int]] = []
-        for i, item in enumerate(prompts):
-            choice = item["positive"] if polarity == "positive" else item["negative"]
-            batch_ids.append(_tokenize_messages(tokenizer, item["question"], choice))
-            if len(batch_ids) == batch_size or i == len(prompts) - 1:
-                _process_batch(batch_ids, store)
-                batch_ids = []
-        logger.info(f"  Done. Collected activations for {len(store)} layers.")
-
-    # Compute mean-difference direction per layer and normalise
-    layer_indices = sorted(pos_hiddens.keys())
-    directions: dict[int, torch.Tensor] = {}
-    for layer_idx in layer_indices:
-        pos_mean = torch.stack(pos_hiddens[layer_idx]).mean(dim=0)
-        neg_mean = torch.stack(neg_hiddens[layer_idx]).mean(dim=0)
-        direction = pos_mean - neg_mean
-        norm = direction.norm()
-        if norm > 0:
-            direction = direction / norm
-        directions[layer_idx] = direction
-
-    return directions
+    Returns a list of length n_layers, each shape (hidden_dim,).
+    The chat template always ends with <answer><EOS>, so -2 is reliably the answer token.
+    """
+    input_tensor = torch.tensor([token_ids], dtype=torch.long, device=model.device)
+    outputs = model(input_ids=input_tensor, attention_mask=torch.ones_like(input_tensor), output_hidden_states=True)
+    return [hs[0, -3, :].float().detach().cpu() for hs in outputs.hidden_states[1:]]
 
 
 def _sanity_check(directions: dict[int, torch.Tensor], pos_hiddens: dict, neg_hiddens: dict) -> None:
@@ -147,48 +85,26 @@ def main(args: argparse.Namespace) -> None:
     if args.chat_template_name and args.chat_template_name in CHAT_TEMPLATES:
         tokenizer.chat_template = CHAT_TEMPLATES[args.chat_template_name]
         logger.info(f"Applied chat template: {args.chat_template_name}")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     logger.info(f"Loading model from {args.model_name_or_path}...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto"
     )
     model.eval()
 
-    # Run extraction with separate stores for sanity check
     pos_hiddens: dict[int, list[torch.Tensor]] = {}
     neg_hiddens: dict[int, list[torch.Tensor]] = {}
 
-    @torch.no_grad()
-    def _process_batch_into(batch_token_ids, store):
-        max_len = max(len(ids) for ids in batch_token_ids)
-        pad_id = tokenizer.pad_token_id or 0
-        input_ids_padded = torch.tensor(
-            [[pad_id] * (max_len - len(ids)) + ids for ids in batch_token_ids], dtype=torch.long
-        )
-        attention_mask = (input_ids_padded != pad_id).long()
-        outputs = model(
-            input_ids=input_ids_padded.to(model.device),
-            attention_mask=attention_mask.to(model.device),
-            output_hidden_states=True,
-        )
-        per_layer = _last_real_token_hidden(outputs.hidden_states, attention_mask)
-        for layer_idx, h in enumerate(per_layer):
-            if layer_idx not in store:
-                store[layer_idx] = []
-            for example_h in h.unbind(dim=0):
-                store[layer_idx].append(example_h)
-
     for polarity, store in [("positive", pos_hiddens), ("negative", neg_hiddens)]:
-        logger.info(f"Extracting {polarity} activations ({len(prompts)} prompts, batch_size={args.batch_size})...")
-        batch_ids: list[list[int]] = []
-        for i, item in enumerate(prompts):
+        logger.info(f"Extracting {polarity} activations ({len(prompts)} prompts)...")
+        for item in prompts:
             choice = item["positive"] if polarity == "positive" else item["negative"]
-            batch_ids.append(_tokenize_messages(tokenizer, item["question"], choice))
-            if len(batch_ids) == args.batch_size or i == len(prompts) - 1:
-                _process_batch_into(batch_ids, store)
-                batch_ids = []
+            token_ids = _tokenize_messages(tokenizer, item["question"], choice)
+            print(tokenizer.decode(token_ids[-3]))
+            per_layer = _extract_answer_hidden(token_ids, model)
+            for layer_idx, h in enumerate(per_layer):
+                if layer_idx not in store:
+                    store[layer_idx] = []
+                store[layer_idx].append(h)
         logger.info(f"  {polarity}: collected activations at {len(store)} layers.")
 
     # Compute mean-difference directions
@@ -245,5 +161,4 @@ if __name__ == "__main__":
         help="Chat template name from CHAT_TEMPLATES (e.g. olmo_thinker). "
         "Leave empty to use the tokenizer's default template.",
     )
-    parser.add_argument("--batch_size", type=int, default=8)
     main(parser.parse_args())

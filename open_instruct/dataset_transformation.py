@@ -944,7 +944,7 @@ EMPTY_DATASET_STATISTICS = {"per_dataset_stats": [], "dataset_order": []}
 
 # Cache version: increment this when transformation logic changes significantly
 # to invalidate old caches. v6: Added return_dict=False to apply_chat_template calls for transformers 5.x.
-DATASET_CACHE_VERSION = "v6"
+DATASET_CACHE_VERSION = "v7"
 
 
 def _normalize_env_config_column(row: dict[str, Any]) -> None:
@@ -1776,14 +1776,55 @@ def _get_serializable_dataset_config_dict(dc: DatasetConfig, exclude_none: bool 
     return d
 
 
+# DatasetConfig fields that are both (a) under the caller's control and (b) fully
+# determine the transformed output. The cache key is built from only these fields so
+# it stays stable run-to-run. In particular `dataset_commit_hash` is excluded: it is
+# fetched live from the HF Hub in DatasetConfig.__post_init__ and can vary or come back
+# absent across runs (e.g. unauthenticated / rate-limited requests), which would
+# otherwise change the key and silently defeat the cache. The remaining auto-derived
+# fields (`original_dataset_size`, `is_upsampled`) are likewise excluded. Pin
+# `dataset_revision` if you need the cache to invalidate when the upstream data changes.
+_HASHABLE_DATASET_CONFIG_FIELDS = (
+    "dataset_name",
+    "dataset_split",
+    "dataset_revision",
+    "dataset_range",
+    "transform_fn",
+    "transform_fn_args",
+    "target_columns",
+    "dataset_config_seed",
+    "frac_or_num_samples",
+)
+
+
+def _get_hashable_dataset_config_dict(dc: DatasetConfig) -> dict:
+    """Controllable, deterministic subset of a DatasetConfig used for cache-key hashing."""
+    d = asdict(dc)
+    return {k: d[k] for k in _HASHABLE_DATASET_CONFIG_FIELDS if d.get(k) is not None}
+
+
+# TokenizerConfig "for tracking purposes" fields that must NOT feed the cache key.
+# `tokenizer_files_hash` is populated on first tokenizer access via get_file_hash ->
+# custom_cached_file: it is a content sha256 when the files are resolvable/cached, but
+# falls back to "<filename> not found" when they are not (offline / unauthenticated /
+# rate-limited). That makes it vary across runs and would silently defeat the cache.
+# Tokenizer identity is still captured by tokenizer_name_or_path + tokenizer_revision +
+# the separately hashed chat template; pin tokenizer_revision to invalidate on change.
+_VOLATILE_TOKENIZER_CONFIG_FIELDS = ("tokenizer_files_hash",)
+
+
 def compute_config_hash(dcs: list[DatasetConfig], tc: TokenizerConfig) -> str:
     """Compute a deterministic hash of both configs for caching.
 
     The hash includes DATASET_CACHE_VERSION to invalidate old caches when
-    transformation logic changes significantly.
+    transformation logic changes significantly. Only controllable, deterministic fields
+    feed the key (see ``_HASHABLE_DATASET_CONFIG_FIELDS`` and
+    ``_VOLATILE_TOKENIZER_CONFIG_FIELDS``), so it is stable across runs and does not
+    depend on network-fetched values like ``dataset_commit_hash`` or
+    ``tokenizer_files_hash``.
     """
-    dc_dicts = [_get_serializable_dataset_config_dict(dc, exclude_none=True) for dc in dcs]
-    tc_dict = {k: v for k, v in asdict(tc).items() if v is not None}
+    dc_dicts = [_get_hashable_dataset_config_dict(dc) for dc in dcs]
+    tc_dict = {k: v for k, v in asdict(tc).items() if v is not None and k not in _VOLATILE_TOKENIZER_CONFIG_FIELDS}
     chat_template = getattr(tc.tokenizer, "chat_template", None)
     try:
         chat_template_str = json.dumps(chat_template, sort_keys=True)

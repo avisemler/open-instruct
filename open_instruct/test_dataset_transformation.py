@@ -85,6 +85,69 @@ class TestConfigHash(unittest.TestCase):
         hash2 = open_instruct.dataset_transformation.compute_config_hash(dcs2, tc)
         self.assertNotEqual(hash1, hash2, "Different configs should have different hashes")
 
+    def test_config_hash_ignores_dataset_commit_hash(self):
+        """The cache key must not depend on the network-fetched dataset_commit_hash.
+
+        Otherwise an unauthenticated / rate-limited run that fails to resolve the commit
+        hash would compute a different key and silently miss the cache.
+        """
+        tc = open_instruct.dataset_transformation.TokenizerConfig(
+            tokenizer_name_or_path=TOKENIZER_PATH, tokenizer_revision="main", chat_template_name="tulu"
+        )
+        sft_data = os.path.join(TEST_DATA_DIR, "sft_sample.jsonl")
+
+        def make_dc():
+            return open_instruct.dataset_transformation.DatasetConfig(
+                dataset_name=sft_data,
+                dataset_split="train",
+                dataset_revision="main",
+                transform_fn=["sft_tokenize_v1"],
+                transform_fn_args=[{}],
+            )
+
+        dc_a = make_dc()
+        dc_b = make_dc()
+        dc_a.dataset_commit_hash = "commit_aaa"
+        dc_b.dataset_commit_hash = "commit_bbb"
+
+        hash_a = open_instruct.dataset_transformation.compute_config_hash([dc_a], tc)
+        hash_b = open_instruct.dataset_transformation.compute_config_hash([dc_b], tc)
+        self.assertEqual(hash_a, hash_b, "dataset_commit_hash must not affect the cache key")
+
+    def test_config_hash_ignores_tokenizer_files_hash(self):
+        """The cache key must not depend on the tokenizer_files_hash.
+
+        It is a content hash when the tokenizer files are resolvable/cached but falls back
+        to "<file> not found" offline / rate-limited, so it varies across runs and would
+        otherwise miss the cache.
+        """
+        sft_data = os.path.join(TEST_DATA_DIR, "sft_sample.jsonl")
+
+        def make_dcs():
+            return [
+                open_instruct.dataset_transformation.DatasetConfig(
+                    dataset_name=sft_data,
+                    dataset_split="train",
+                    dataset_revision="main",
+                    transform_fn=["sft_tokenize_v1"],
+                    transform_fn_args=[{}],
+                )
+            ]
+
+        def make_tc():
+            return open_instruct.dataset_transformation.TokenizerConfig(
+                tokenizer_name_or_path=TOKENIZER_PATH, tokenizer_revision="main", chat_template_name="tulu"
+            )
+
+        tc_a = make_tc()
+        tc_b = make_tc()
+        tc_a.tokenizer_files_hash = ["sha_aaa"]
+        tc_b.tokenizer_files_hash = ["file not found"]
+
+        hash_a = open_instruct.dataset_transformation.compute_config_hash(make_dcs(), tc_a)
+        hash_b = open_instruct.dataset_transformation.compute_config_hash(make_dcs(), tc_b)
+        self.assertEqual(hash_a, hash_b, "tokenizer_files_hash must not affect the cache key")
+
 
 class TestCachedDataset(unittest.TestCase):
     def setUp(self):

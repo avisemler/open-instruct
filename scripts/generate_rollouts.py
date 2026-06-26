@@ -32,6 +32,11 @@ so grading is self-contained and does not depend on the dataset row order matchi
 Examples are generated one at a time and their completions are appended (and flushed)
 to the output file immediately, so partial progress survives an interrupted run.
 
+--system_prompt_suffix appends text to the system prompt at inference time. Because the
+dataset ships pre-tokenized, this re-renders the chat template per example: the conversation
+is parsed back from the dataset's flattened `prompt` column (multi-turn) and the suffix is
+appended to the base system prompt (--system_prompt_override_file, else empty).
+
 Disk efficiency: this stage and grade_rollouts.py share the Hugging Face model/dataset
 cache and the optional on-disk Dolci subset. Only this stage loads the model weights.
 """
@@ -49,12 +54,74 @@ from open_instruct import grpo_utils, logger_utils
 from open_instruct.dataset_transformation import (
     GROUND_TRUTHS_KEY,
     INPUT_IDS_PROMPT_KEY,
+    RAW_PROMPT_KEY,
     VERIFIER_SOURCE_KEY,
     TokenizerConfig,
 )
 from open_instruct.environments.tools.utils import EnvsConfig
 
 logger = logger_utils.setup_logger(__name__)
+
+
+def build_effective_system(
+    streaming_config: data_loader_lib.StreamingDataLoaderConfig, system_prompt_suffix: str | None
+) -> str | None:
+    """Resolve the system-prompt content to render with when a suffix is requested.
+
+    Returns ``None`` (meaning: use the dataset's baked prompt as-is) when no suffix is set.
+    Otherwise the base system prompt is the contents of ``system_prompt_override_file`` (if
+    configured; the scripts default it to the math system prompt) and the suffix is appended.
+    """
+    if system_prompt_suffix is None:
+        return None
+    base = ""
+    if streaming_config.system_prompt_override_file is not None:
+        with open(streaming_config.system_prompt_override_file) as f:
+            base = f.read().strip()
+    return f"{base}\n\n{system_prompt_suffix}" if base else system_prompt_suffix
+
+
+# Roles that can begin a turn in the flattened RAW_PROMPT_KEY string.
+_FLATTENED_PROMPT_ROLES = ("system", "user", "assistant")
+
+
+def messages_from_flattened_prompt(text: str) -> list[dict]:
+    """Invert the dataset's flattened ``prompt`` string back into chat messages.
+
+    The dataset stores the prompt as ``"\\n".join(f"{role}: {content}")`` over the
+    conversation turns (see ``rlvr_tokenize_*`` in dataset_transformation.py), so a multi-turn
+    prompt looks like ``"user: ...\\nassistant: ...\\nuser: ..."``. We split on lines that begin
+    with a known ``"role: "`` prefix; any other line is a continuation of the current message's
+    content (which may span multiple lines).
+    """
+    messages: list[dict] = []
+    for line in text.split("\n"):
+        role = next((r for r in _FLATTENED_PROMPT_ROLES if line.startswith(f"{r}: ")), None)
+        if role is not None:
+            messages.append({"role": role, "content": line[len(role) + 2 :]})
+        elif messages:
+            messages[-1]["content"] += "\n" + line
+        else:
+            # No leading role prefix at all -> treat the whole thing as a single user turn.
+            messages.append({"role": "user", "content": line})
+    return messages
+
+
+def prompt_token_ids_for(row: dict, tokenizer, effective_system: str | None) -> list[int]:
+    """Return the prompt token ids for one example.
+
+    With ``effective_system is None`` the dataset's pre-tokenized ``input_ids_prompt`` is used
+    unchanged. Otherwise the chat template is re-rendered from the dataset's flattened ``prompt``
+    column (parsed back into multi-turn messages) with ``effective_system`` replacing the system
+    prompt — this is how a system-prompt suffix takes effect on a pre-tokenized dataset.
+    """
+    if effective_system is None:
+        return list(row[INPUT_IDS_PROMPT_KEY])
+    messages = messages_from_flattened_prompt(row[RAW_PROMPT_KEY])
+    if messages and messages[0]["role"] == "system":
+        messages = messages[1:]
+    messages = [{"role": "system", "content": effective_system}, *messages]
+    return tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_dict=False)
 
 
 def generate_with_vllm(
@@ -65,6 +132,7 @@ def generate_with_vllm(
     streaming_config: data_loader_lib.StreamingDataLoaderConfig,
     vllm_config: data_loader_lib.VLLMConfig,
     seed: int,
+    effective_system: str | None = None,
 ) -> "Iterator[tuple[int, list[str]]]":
     """Yield ``(idx, [completion_text, ...])`` one dataset example at a time.
 
@@ -115,15 +183,22 @@ def generate_with_vllm(
     )
 
     for i in range(n):
-        outputs = llm.generate(
-            [{"prompt_token_ids": list(dataset[i][INPUT_IDS_PROMPT_KEY])}], sampling_params=sampling_params
-        )
+        prompt_token_ids = prompt_token_ids_for(dataset[i], tokenizer, effective_system)
+        if i == 0 and effective_system is not None:
+            logger.info(f"Reconstructed prompt (example 0):\n{tokenizer.decode(prompt_token_ids)}")
+        outputs = llm.generate([{"prompt_token_ids": prompt_token_ids}], sampling_params=sampling_params)
         texts = [tokenizer.decode(o.token_ids, skip_special_tokens=False) for o in outputs[0].outputs]
         yield i, texts
 
 
 def generate_with_transformers(
-    dataset, model_name_or_path: str, tokenizer, max_examples: int, max_new_tokens: int, temperature: float
+    dataset,
+    model_name_or_path: str,
+    tokenizer,
+    max_examples: int,
+    max_new_tokens: int,
+    temperature: float,
+    effective_system: str | None = None,
 ) -> "Iterator[tuple[int, list[str]]]":
     """Yield ``(idx, [completion_text])`` one dataset example at a time (local HF model)."""
     logger.info(f"Loading model {model_name_or_path} for local generation...")
@@ -135,7 +210,9 @@ def generate_with_transformers(
         f"Generating {n} completions, one at a time (temperature={temperature}, max_new_tokens={max_new_tokens})..."
     )
     for i in range(n):
-        input_ids = dataset[i][INPUT_IDS_PROMPT_KEY]
+        input_ids = prompt_token_ids_for(dataset[i], tokenizer, effective_system)
+        if i == 0 and effective_system is not None:
+            logger.info(f"Reconstructed prompt (example 0):\n{tokenizer.decode(input_ids)}")
         input_tensor = torch.tensor([input_ids], device=model.device)
 
         with torch.no_grad():
@@ -183,6 +260,12 @@ def main(
         script_args, args, tc, streaming_config, tokenizer, needs_tokenized_prompts=True
     )
 
+    # When a suffix is set, prompts are re-rendered with this system content (else None =
+    # use the dataset's baked input_ids_prompt unchanged).
+    effective_system = build_effective_system(streaming_config, script_args.system_prompt_suffix)
+    if effective_system is not None:
+        logger.info(f"Re-tokenizing prompts with system prompt:\n#####\n{effective_system}\n#####")
+
     if script_args.generate_with_vllm:
         if script_args.model_name_or_path is None:
             raise ValueError("--model_name_or_path is required with --generate_with_vllm")
@@ -194,6 +277,7 @@ def main(
             streaming_config=streaming_config,
             vllm_config=vllm_config,
             seed=args.seed,
+            effective_system=effective_system,
         )
     else:
         if script_args.model_name_or_path is None:
@@ -205,6 +289,7 @@ def main(
             max_examples=script_args.max_examples,
             max_new_tokens=streaming_config.response_length * 4,
             temperature=streaming_config.temperature,
+            effective_system=effective_system,
         )
 
     # Generate one dataset example at a time and append its completions to the output
@@ -234,6 +319,16 @@ if __name__ == "__main__":
     parser.add_argument("--model_name_or_path", type=str, default="allenai/Olmo-3.1-32B-Think")
     parser.add_argument("--max_examples", type=int, default=100)
     parser.add_argument("--output_jsonl", type=str, default="/tmp/generate_rollouts.jsonl")
+    parser.add_argument(
+        "--system_prompt_suffix",
+        type=str,
+        default=None,
+        help=(
+            "If set, re-tokenize each prompt with this text appended to the system prompt "
+            "(base = --system_prompt_override_file, else empty). Required because the dataset ships "
+            "pre-tokenized; the user turn is reconstructed from the dataset's `prompt` column."
+        ),
+    )
     common.add_shared_dataset_args(parser)
     script_args, remaining = parser.parse_known_args()
 

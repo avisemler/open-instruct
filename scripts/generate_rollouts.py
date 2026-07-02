@@ -12,7 +12,7 @@ Two generation backends:
      --model_name_or_path allenai/OLMo-2-1124-7B-Instruct \
      --generate_with_vllm \
      --max_examples 100 \
-     --output_jsonl /tmp/completions.jsonl \
+     --output_dir /tmp/generate_rollouts \
      [normal Open-Instruct dataset/tokenizer/config args...]
 
 2. Local transformers:
@@ -20,14 +20,20 @@ Two generation backends:
      --model_name_or_path allenai/OLMo-2-1124-7B-Instruct \
      --generate_with_transformers \
      --max_examples 100 \
-     --output_jsonl /tmp/completions.jsonl \
+     --output_dir /tmp/generate_rollouts \
      [normal Open-Instruct dataset/tokenizer/config args...]
 
-Output JSONL format (one row per completion):
-{"idx": 0, "completion": "...", "ground_truth": ..., "dataset": "..."}
+Each run creates a fresh timestamped subdirectory under ``--output_dir`` (e.g.
+``/tmp/generate_rollouts/20260702_153000_482913/``) containing:
+  * ``args.json``      -- every argument the run was invoked with
+  * ``rollouts.jsonl``  -- one row per completion:
+    {"idx": 0, "prompt": "...", "completion": "...", "ground_truth": ..., "dataset": "..."}
 
-The ``ground_truth`` and ``dataset`` (verifier source) columns are carried forward
-so grading is self-contained and does not depend on the dataset row order matching.
+The ``prompt`` (flattened task prompt), ``ground_truth``, and ``dataset`` (verifier source)
+columns are carried forward so downstream stages (grading, judging) are self-contained and
+do not depend on the dataset row order matching. Score completions against verifiers with
+``scripts/grade_rollouts.py``; judge them for evaluation awareness with
+``scripts/judge_eval_awareness.py``.
 
 Examples are generated one at a time and their completions are appended (and flushed)
 to the output file immediately, so partial progress survives an interrupted run.
@@ -42,7 +48,11 @@ cache and the optional on-disk Dolci subset. Only this stage loads the model wei
 """
 
 import argparse
+import dataclasses
 import json
+import os
+import random
+import time
 from collections.abc import Iterator
 
 import rlvr_rollouts_common as common
@@ -133,12 +143,16 @@ def generate_with_vllm(
     vllm_config: data_loader_lib.VLLMConfig,
     seed: int,
     effective_system: str | None = None,
+    batch_size: int = 64,
 ) -> "Iterator[tuple[int, list[str]]]":
-    """Yield ``(idx, [completion_text, ...])`` one dataset example at a time.
+    """Yield ``(idx, [completion_text, ...])``, ``batch_size`` examples at a time.
 
-    The vLLM engine is loaded once, then each dataset example is generated on its own
-    so the caller can persist results incrementally. Each example yields
-    ``num_samples_per_prompt_rollout`` completion strings.
+    The vLLM engine is loaded once. Prompts are submitted to ``llm.generate()`` in batches
+    of ``batch_size`` so vLLM's continuous batching scheduler can run many sequences
+    concurrently on the GPU -- submitting one prompt per call serializes everything and
+    leaves the GPU idle most of the time. Results are still yielded (and can be persisted)
+    one example at a time as each batch completes, so at most one batch of progress is lost
+    on a crash. Each example yields ``num_samples_per_prompt_rollout`` completion strings.
 
     Mirrors the sampling setup in grpo_fast.create_generation_configs():
       - max_tokens = streaming_config.response_length
@@ -170,25 +184,28 @@ def generate_with_vllm(
         n=num_samples,
         stop=streaming_config.stop_strings or None,
         seed=seed,
-        logprobs=1,
         include_stop_str_in_output=True,
     )
 
     n = min(max_examples, len(dataset))
     logger.info(
-        f"Generating {n} prompts x {num_samples} sample(s), one example at a time "
+        f"Generating {n} prompts x {num_samples} sample(s) in batches of {batch_size} "
         f"(temperature={streaming_config.temperature}, "
         f"max_tokens={streaming_config.response_length}, "
         f"stop={streaming_config.stop_strings})..."
     )
 
-    for i in range(n):
-        prompt_token_ids = prompt_token_ids_for(dataset[i], tokenizer, effective_system)
-        if i == 0 and effective_system is not None:
-            logger.info(f"Reconstructed prompt (example 0):\n{tokenizer.decode(prompt_token_ids)}")
-        outputs = llm.generate([{"prompt_token_ids": prompt_token_ids}], sampling_params=sampling_params)
-        texts = [tokenizer.decode(o.token_ids, skip_special_tokens=False) for o in outputs[0].outputs]
-        yield i, texts
+    for batch_start in range(0, n, batch_size):
+        batch_indices = range(batch_start, min(batch_start + batch_size, n))
+        prompt_token_ids = [prompt_token_ids_for(dataset[i], tokenizer, effective_system) for i in batch_indices]
+        if batch_start == 0 and effective_system is not None:
+            logger.info(f"Reconstructed prompt (example 0):\n{tokenizer.decode(prompt_token_ids[0])}")
+        outputs = llm.generate(
+            [{"prompt_token_ids": ids} for ids in prompt_token_ids], sampling_params=sampling_params
+        )
+        for i, output in zip(batch_indices, outputs):
+            texts = [tokenizer.decode(o.token_ids, skip_special_tokens=False) for o in output.outputs]
+            yield i, texts
 
 
 def generate_with_transformers(
@@ -233,15 +250,47 @@ def generate_with_transformers(
 def _rows_for_example(idx: int, texts: list[str], dataset) -> list[dict]:
     """Build the output rows for one dataset example.
 
-    Embeds the verifier ground truth + source so the grading stage is self-contained:
-    it does not need to reload the dataset or rely on row ordering matching.
+    Embeds the task prompt and the verifier ground truth + source so downstream stages
+    (grading, judging) are self-contained: they don't need to reload the dataset or rely
+    on row ordering matching.
     """
     row = dataset[idx]
+    prompt = row[RAW_PROMPT_KEY]
     ground_truth = row[GROUND_TRUTHS_KEY]
     verifier_source = row[VERIFIER_SOURCE_KEY]
     return [
-        {"idx": idx, "completion": text, "ground_truth": ground_truth, "dataset": verifier_source} for text in texts
+        {"idx": idx, "prompt": prompt, "completion": text, "ground_truth": ground_truth, "dataset": verifier_source}
+        for text in texts
     ]
+
+
+def make_run_dir(output_dir: str) -> str:
+    """Create and return a fresh timestamped subdirectory under ``output_dir``."""
+    run_dir = os.path.join(output_dir, f"{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(0, 999_999):06d}")
+    os.makedirs(run_dir)
+    return run_dir
+
+
+def write_args(
+    run_dir: str,
+    script_args: argparse.Namespace,
+    args: grpo_utils.GRPOExperimentConfig,
+    tc: TokenizerConfig,
+    streaming_config: data_loader_lib.StreamingDataLoaderConfig,
+    vllm_config: data_loader_lib.VLLMConfig,
+    tools_config: EnvsConfig,
+) -> None:
+    """Dump every argument this run was invoked with to ``run_dir/args.json``."""
+    payload = {
+        "script_args": vars(script_args),
+        "args": dataclasses.asdict(args),
+        "tokenizer_config": dataclasses.asdict(tc),
+        "streaming_config": dataclasses.asdict(streaming_config),
+        "vllm_config": dataclasses.asdict(vllm_config),
+        "tools_config": dataclasses.asdict(tools_config),
+    }
+    with open(os.path.join(run_dir, "args.json"), "w") as f:
+        json.dump(payload, f, indent=2, default=str)
 
 
 def main(
@@ -252,6 +301,10 @@ def main(
     vllm_config: data_loader_lib.VLLMConfig,
     tools_config: EnvsConfig,
 ) -> None:
+    run_dir = make_run_dir(script_args.output_dir)
+    write_args(run_dir, script_args, args, tc, streaming_config, vllm_config, tools_config)
+    logger.info(f"Run directory: {run_dir}")
+
     # --model_name_or_path doubles as the tokenizer source when --tokenizer_name_or_path
     # is not supplied separately.
     tokenizer = common.resolve_tokenizer(tc, script_args.model_name_or_path)
@@ -278,6 +331,7 @@ def main(
             vllm_config=vllm_config,
             seed=args.seed,
             effective_system=effective_system,
+            batch_size=script_args.generation_batch_size,
         )
     else:
         if script_args.model_name_or_path is None:
@@ -294,9 +348,10 @@ def main(
 
     # Generate one dataset example at a time and append its completions to the output
     # file immediately, flushing after each example so partial progress survives a crash.
-    logger.info(f"Writing completions incrementally to {script_args.output_jsonl}...")
+    rollouts_path = os.path.join(run_dir, "rollouts.jsonl")
+    logger.info(f"Writing completions incrementally to {rollouts_path}...")
     n_written = 0
-    with open(script_args.output_jsonl, "w") as f:
+    with open(rollouts_path, "w") as f:
         for idx, texts in row_stream:
             for row in _rows_for_example(idx, texts, train_dataset):
                 f.write(json.dumps(row) + "\n")
@@ -305,10 +360,7 @@ def main(
             if idx < 5:
                 logger.info(f"  example {idx}: {texts[0][:300]}")
 
-    logger.info(
-        f"Done. Wrote {n_written} completions to {script_args.output_jsonl}. "
-        "Score them with scripts/grade_rollouts.py."
-    )
+    logger.info(f"Done. Wrote {n_written} completions to {rollouts_path}. Score them with scripts/grade_rollouts.py.")
 
 
 if __name__ == "__main__":
@@ -318,7 +370,27 @@ if __name__ == "__main__":
     # Optional: doubles as tokenizer source when --tokenizer_name_or_path is absent
     parser.add_argument("--model_name_or_path", type=str, default="allenai/Olmo-3.1-32B-Think")
     parser.add_argument("--max_examples", type=int, default=100)
-    parser.add_argument("--output_jsonl", type=str, default="/tmp/generate_rollouts.jsonl")
+    parser.add_argument(
+        "--generation_batch_size",
+        type=int,
+        default=64,
+        help=(
+            "Number of prompts submitted to vLLM's generate() call at once (vLLM backend only). "
+            "Larger values let vLLM's continuous batching scheduler keep more sequences in flight "
+            "concurrently, which is much faster than one prompt per call. Only affects crash-recovery "
+            "granularity (progress is flushed as each batch completes), not output correctness. Tune "
+            "down if you hit GPU OOM with a long --response_length."
+        ),
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./generate_rollouts",
+        help=(
+            "Directory under which a fresh timestamped subdirectory is created for this run, "
+            "containing args.json (the run's arguments) and rollouts.jsonl (the completions)."
+        ),
+    )
     parser.add_argument(
         "--system_prompt_suffix",
         type=str,

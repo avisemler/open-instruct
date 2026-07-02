@@ -20,6 +20,7 @@ wandb
 data/*
 # !data/processed
 output/
+generate_rollouts/
 configs/beaker_configs/auto_created
 
 # Byte-compiled / optimized / DLL files

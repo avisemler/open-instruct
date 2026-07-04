@@ -149,6 +149,7 @@ def generate_with_vllm(
     effective_system: str | None = None,
     batch_size: int = 64,
     start_idx: int = 0,
+    model_revision: str | None = None,
 ) -> "Iterator[tuple[int, list[str]]]":
     """Yield ``(idx, [completion_text, ...])``, ``batch_size`` examples at a time.
 
@@ -176,6 +177,7 @@ def generate_with_vllm(
     logger.info(f"Loading {model_name_or_path} with vLLM (max_model_len={max_model_len})...")
     llm = vllm.LLM(
         model=model_name_or_path,
+        revision=model_revision,
         tensor_parallel_size=1,
         gpu_memory_utilization=vllm_config.vllm_gpu_memory_utilization,
         max_model_len=max_model_len,
@@ -225,13 +227,16 @@ def generate_with_transformers(
     temperature: float,
     effective_system: str | None = None,
     start_idx: int = 0,
+    model_revision: str | None = None,
 ) -> "Iterator[tuple[int, list[str]]]":
     """Yield ``(idx, [completion_text])`` one dataset example at a time (local HF model).
 
     ``start_idx`` skips ahead to resume a partially-completed run.
     """
     logger.info(f"Loading model {model_name_or_path} for local generation...")
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path, revision=model_revision, torch_dtype=torch.bfloat16, device_map="auto"
+    )
     model.eval()
     n = min(max_examples, len(dataset))
 
@@ -396,6 +401,7 @@ def main(
             effective_system=effective_system,
             batch_size=script_args.generation_batch_size,
             start_idx=start_idx,
+            model_revision=script_args.model_revision,
         )
     else:
         if script_args.model_name_or_path is None:
@@ -409,6 +415,7 @@ def main(
             temperature=streaming_config.temperature,
             effective_system=effective_system,
             start_idx=start_idx,
+            model_revision=script_args.model_revision,
         )
 
     # Generate one dataset example at a time and append its completions to the output
@@ -438,6 +445,16 @@ if __name__ == "__main__":
     parser.add_argument("--generate_with_transformers", action="store_true")
     # Optional: doubles as tokenizer source when --tokenizer_name_or_path is absent
     parser.add_argument("--model_name_or_path", type=str, default="allenai/Olmo-3.1-32B-Think")
+    parser.add_argument(
+        "--model_revision",
+        type=str,
+        default=None,
+        help=(
+            "Revision of the model to load from the Hugging Face Hub (branch, tag, or commit hash). "
+            "For example, intermediate RLVR checkpoints of OLMo-2-0325-32B-Instruct are accessible "
+            "as revisions such as 'step_200'. Defaults to the latest revision on the main branch."
+        ),
+    )
     parser.add_argument("--max_examples", type=int, default=100)
     parser.add_argument(
         "--generation_batch_size",

@@ -36,7 +36,11 @@ do not depend on the dataset row order matching. Score completions against verif
 ``scripts/judge_eval_awareness.py``.
 
 Examples are generated one at a time and their completions are appended (and flushed)
-to the output file immediately, so partial progress survives an interrupted run.
+to the output file immediately, so partial progress survives an interrupted run. To resume
+an interrupted run, pass ``--run_subdir <name>`` matching the timestamped subdir it was
+writing to (printed as "Run directory: ..." at startup); generation picks up from the first
+example not yet completed instead of starting over. ``--run_subdir`` also works on a fresh
+name to control where output goes.
 
 --system_prompt_suffix appends text to the system prompt at inference time. Because the
 dataset ships pre-tokenized, this re-renders the chat template per example: the conversation
@@ -144,6 +148,7 @@ def generate_with_vllm(
     seed: int,
     effective_system: str | None = None,
     batch_size: int = 64,
+    start_idx: int = 0,
 ) -> "Iterator[tuple[int, list[str]]]":
     """Yield ``(idx, [completion_text, ...])``, ``batch_size`` examples at a time.
 
@@ -153,6 +158,9 @@ def generate_with_vllm(
     leaves the GPU idle most of the time. Results are still yielded (and can be persisted)
     one example at a time as each batch completes, so at most one batch of progress is lost
     on a crash. Each example yields ``num_samples_per_prompt_rollout`` completion strings.
+
+    ``start_idx`` skips ahead to resume a partially-completed run (examples before it were
+    already generated and persisted in a previous invocation).
 
     Mirrors the sampling setup in grpo_fast.create_generation_configs():
       - max_tokens = streaming_config.response_length
@@ -192,10 +200,10 @@ def generate_with_vllm(
         f"Generating {n} prompts x {num_samples} sample(s) in batches of {batch_size} "
         f"(temperature={streaming_config.temperature}, "
         f"max_tokens={streaming_config.response_length}, "
-        f"stop={streaming_config.stop_strings})..."
+        f"stop={streaming_config.stop_strings})" + (f", resuming from example {start_idx}..." if start_idx else "...")
     )
 
-    for batch_start in range(0, n, batch_size):
+    for batch_start in range(start_idx, n, batch_size):
         batch_indices = range(batch_start, min(batch_start + batch_size, n))
         prompt_token_ids = [prompt_token_ids_for(dataset[i], tokenizer, effective_system) for i in batch_indices]
         if batch_start == 0 and effective_system is not None:
@@ -216,17 +224,22 @@ def generate_with_transformers(
     max_new_tokens: int,
     temperature: float,
     effective_system: str | None = None,
+    start_idx: int = 0,
 ) -> "Iterator[tuple[int, list[str]]]":
-    """Yield ``(idx, [completion_text])`` one dataset example at a time (local HF model)."""
+    """Yield ``(idx, [completion_text])`` one dataset example at a time (local HF model).
+
+    ``start_idx`` skips ahead to resume a partially-completed run.
+    """
     logger.info(f"Loading model {model_name_or_path} for local generation...")
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto")
     model.eval()
     n = min(max_examples, len(dataset))
 
     logger.info(
-        f"Generating {n} completions, one at a time (temperature={temperature}, max_new_tokens={max_new_tokens})..."
+        f"Generating {n} completions, one at a time (temperature={temperature}, max_new_tokens={max_new_tokens})"
+        + (f", resuming from example {start_idx}..." if start_idx else "...")
     )
-    for i in range(n):
+    for i in range(start_idx, n):
         input_ids = prompt_token_ids_for(dataset[i], tokenizer, effective_system)
         if i == 0 and effective_system is not None:
             logger.info(f"Reconstructed prompt (example 0):\n{tokenizer.decode(input_ids)}")
@@ -264,11 +277,43 @@ def _rows_for_example(idx: int, texts: list[str], dataset) -> list[dict]:
     ]
 
 
-def make_run_dir(output_dir: str) -> str:
-    """Create and return a fresh timestamped subdirectory under ``output_dir``."""
-    run_dir = os.path.join(output_dir, f"{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(0, 999_999):06d}")
-    os.makedirs(run_dir)
+def make_run_dir(output_dir: str, run_subdir: str | None = None) -> str:
+    """Create and return the run subdirectory under ``output_dir``.
+
+    With ``run_subdir`` unset, a fresh timestamped name is generated (the normal case). With
+    ``run_subdir`` set, that exact name is used instead -- this is what makes the directory
+    reusable across invocations so a run can be resumed (see ``determine_resume_state``).
+    """
+    name = run_subdir or f"{time.strftime('%Y%m%d_%H%M%S')}_{random.randint(0, 999_999):06d}"
+    run_dir = os.path.join(output_dir, name)
+    os.makedirs(run_dir, exist_ok=run_subdir is not None)
     return run_dir
+
+
+def determine_resume_state(rollouts_path: str, expected_samples_per_idx: int) -> tuple[int, list[dict]]:
+    """Inspect an existing ``rollouts.jsonl`` and determine where to resume generation.
+
+    Rows are written to disk in increasing ``idx`` order, flushed after each example's rows are
+    all written, so a crash can only leave the *last* idx's rows incomplete. Returns
+    ``(resume_idx, rows_to_keep)``: rows for the last idx are dropped (and generation restarts
+    at that idx) if there are fewer of them than ``expected_samples_per_idx``.
+    """
+    if not os.path.exists(rollouts_path):
+        return 0, []
+    rows = []
+    with open(rollouts_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    if not rows:
+        return 0, []
+    last_idx = rows[-1]["idx"]
+    last_idx_rows = [r for r in rows if r["idx"] == last_idx]
+    if len(last_idx_rows) < expected_samples_per_idx:
+        rows = [r for r in rows if r["idx"] != last_idx]
+        return last_idx, rows
+    return last_idx + 1, rows
 
 
 def write_args(
@@ -280,7 +325,14 @@ def write_args(
     vllm_config: data_loader_lib.VLLMConfig,
     tools_config: EnvsConfig,
 ) -> None:
-    """Dump every argument this run was invoked with to ``run_dir/args.json``."""
+    """Dump every argument this run was invoked with to ``run_dir/args.json``.
+
+    No-ops if ``args.json`` already exists (a resumed run), so the file always reflects the
+    arguments of the original invocation that created the run directory.
+    """
+    args_path = os.path.join(run_dir, "args.json")
+    if os.path.exists(args_path):
+        return
     payload = {
         "script_args": vars(script_args),
         "args": dataclasses.asdict(args),
@@ -289,7 +341,7 @@ def write_args(
         "vllm_config": dataclasses.asdict(vllm_config),
         "tools_config": dataclasses.asdict(tools_config),
     }
-    with open(os.path.join(run_dir, "args.json"), "w") as f:
+    with open(args_path, "w") as f:
         json.dump(payload, f, indent=2, default=str)
 
 
@@ -301,7 +353,7 @@ def main(
     vllm_config: data_loader_lib.VLLMConfig,
     tools_config: EnvsConfig,
 ) -> None:
-    run_dir = make_run_dir(script_args.output_dir)
+    run_dir = make_run_dir(script_args.output_dir, script_args.run_subdir)
     write_args(run_dir, script_args, args, tc, streaming_config, vllm_config, tools_config)
     logger.info(f"Run directory: {run_dir}")
 
@@ -319,6 +371,17 @@ def main(
     if effective_system is not None:
         logger.info(f"Re-tokenizing prompts with system prompt:\n#####\n{effective_system}\n#####")
 
+    # If --run_subdir points at a directory left over from a previous (possibly interrupted)
+    # invocation, pick up where it left off instead of regenerating already-completed examples.
+    expected_samples_per_idx = streaming_config.num_samples_per_prompt_rollout if script_args.generate_with_vllm else 1
+    rollouts_path = os.path.join(run_dir, "rollouts.jsonl")
+    start_idx, kept_rows = determine_resume_state(rollouts_path, expected_samples_per_idx)
+    if start_idx:
+        logger.info(
+            f"Resuming from {rollouts_path}: {len(kept_rows)} completions already present, "
+            f"continuing from example {start_idx}."
+        )
+
     if script_args.generate_with_vllm:
         if script_args.model_name_or_path is None:
             raise ValueError("--model_name_or_path is required with --generate_with_vllm")
@@ -332,6 +395,7 @@ def main(
             seed=args.seed,
             effective_system=effective_system,
             batch_size=script_args.generation_batch_size,
+            start_idx=start_idx,
         )
     else:
         if script_args.model_name_or_path is None:
@@ -344,14 +408,16 @@ def main(
             max_new_tokens=streaming_config.response_length * 4,
             temperature=streaming_config.temperature,
             effective_system=effective_system,
+            start_idx=start_idx,
         )
 
     # Generate one dataset example at a time and append its completions to the output
     # file immediately, flushing after each example so partial progress survives a crash.
-    rollouts_path = os.path.join(run_dir, "rollouts.jsonl")
     logger.info(f"Writing completions incrementally to {rollouts_path}...")
     n_written = 0
     with open(rollouts_path, "w") as f:
+        for row in kept_rows:
+            f.write(json.dumps(row) + "\n")
         for idx, texts in row_stream:
             for row in _rows_for_example(idx, texts, train_dataset):
                 f.write(json.dumps(row) + "\n")
@@ -360,7 +426,10 @@ def main(
             if idx < 5:
                 logger.info(f"  example {idx}: {texts[0][:300]}")
 
-    logger.info(f"Done. Wrote {n_written} completions to {rollouts_path}. Score them with scripts/grade_rollouts.py.")
+    logger.info(
+        f"Done. Wrote {n_written} new completions ({len(kept_rows) + n_written} total) to {rollouts_path}. "
+        "Score them with scripts/grade_rollouts.py."
+    )
 
 
 if __name__ == "__main__":
@@ -389,6 +458,17 @@ if __name__ == "__main__":
         help=(
             "Directory under which a fresh timestamped subdirectory is created for this run, "
             "containing args.json (the run's arguments) and rollouts.jsonl (the completions)."
+        ),
+    )
+    parser.add_argument(
+        "--run_subdir",
+        type=str,
+        default=None,
+        help=(
+            "Name of the run subdirectory under --output_dir, overriding the default fresh "
+            "timestamped name. If this subdirectory already exists and contains a rollouts.jsonl "
+            "from a previous invocation, generation resumes from the first example index not yet "
+            "completed instead of starting over."
         ),
     )
     parser.add_argument(

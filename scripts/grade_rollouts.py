@@ -2,18 +2,24 @@
 """
 Grade rollouts (completions) for RLVR / verifiable-reward tasks and emit rewards.
 
-This is the second stage of the two-stage rewards-only pipeline. It scores the
-completions written by ``scripts/generate_rollouts.py`` (or any compatible JSONL)
-against the verifiable-reward functions, without GRPO training.
+This is the second stage of the rewards-only pipeline, run after
+``scripts/generate_rollouts.py`` (judging with ``scripts/judge_eval_awareness.py`` is
+independent and optional). It scores completions against the verifiable-reward
+functions, without GRPO training.
 
-Usage:
+Usage (run directory produced by generate_rollouts.py):
+   python scripts/grade_rollouts.py \
+     --run_dir /tmp/generate_rollouts/20260702_153000_482913 \
+     [normal Open-Instruct dataset/tokenizer/config args...]
+
+Reads:  <run_dir>/rollouts.jsonl   {"idx", "prompt", "completion", "ground_truth", "dataset"}
+Writes: <run_dir>/rewards.jsonl
+
+Usage (any compatible JSONL, e.g. externally-produced completions):
    python scripts/grade_rollouts.py \
      --completions_jsonl /tmp/completions.jsonl \
      --output_jsonl /tmp/rewards.jsonl \
      [normal Open-Instruct dataset/tokenizer/config args...]
-
-Expected completions JSONL format (as produced by generate_rollouts.py):
-{"idx": 0, "completion": "...", "ground_truth": ..., "dataset": "..."}
 
 When ``ground_truth`` and ``dataset`` are present on each row, no dataset load is
 needed at all. For externally-produced completions that contain only {"idx", "completion"},
@@ -24,6 +30,7 @@ shared rather than duplicated.
 
 import argparse
 import asyncio
+import os
 
 import rlvr_rollouts_common as common
 
@@ -149,13 +156,39 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--completions_jsonl", type=str, required=True)
-    parser.add_argument("--output_jsonl", type=str, required=True)
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help=(
+            "Run directory produced by generate_rollouts.py. When given, completions are read from "
+            "<run_dir>/rollouts.jsonl and results are written to <run_dir>/rewards.jsonl, unless "
+            "--completions_jsonl/--output_jsonl override those paths."
+        ),
+    )
+    parser.add_argument(
+        "--completions_jsonl",
+        type=str,
+        default=None,
+        help="Defaults to <run_dir>/rollouts.jsonl when --run_dir is given.",
+    )
+    parser.add_argument(
+        "--output_jsonl", type=str, default=None, help="Defaults to <run_dir>/rewards.jsonl when --run_dir is given."
+    )
     # Optional: only used (as tokenizer source) when the dataset must be loaded to look
     # up ground truth for completions that don't already carry it.
     parser.add_argument("--model_name_or_path", type=str, default=None)
     common.add_shared_dataset_args(parser)
     script_args, remaining = parser.parse_known_args()
+
+    if script_args.completions_jsonl is None:
+        if script_args.run_dir is None:
+            parser.error("Provide --run_dir or --completions_jsonl.")
+        script_args.completions_jsonl = os.path.join(script_args.run_dir, "rollouts.jsonl")
+    if script_args.output_jsonl is None:
+        if script_args.run_dir is None:
+            parser.error("Provide --run_dir or --output_jsonl.")
+        script_args.output_jsonl = os.path.join(script_args.run_dir, "rewards.jsonl")
 
     args, tc, streaming_config, vllm_config, tools_config = common.parse_oi_configs(remaining)
 

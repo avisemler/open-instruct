@@ -457,7 +457,7 @@ class StreamingDataLoaderConfig:
     """How to combine per-turn rewards: 'last' (use last turn reward) or 'sum' (sum all rewards across turns)."""
 
     # LLM judge verifier
-    llm_judge_model: str = "azure/gpt-4o-mini-standard"
+    llm_judge_model: str = "openrouter/openai/gpt-4o-mini"
     llm_judge_max_tokens: int = 2048
     llm_judge_max_context_length: int = 8192
     llm_judge_temperature: float = 1.0

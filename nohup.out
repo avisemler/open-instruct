@@ -4,3 +4,15 @@ INFO:     Application startup complete.
 ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 1234): address already in use
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
+INFO:     Started server process [41048]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 1234): address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Started server process [47538]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 1234): address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.

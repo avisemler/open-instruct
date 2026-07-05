@@ -78,8 +78,10 @@ def main(args: argparse.Namespace, extra_args: list[str]) -> None:
 
     y_max = max(m + s for m, s in zip(means, sems))
     for i, (mean, sem, p) in enumerate(zip(means, sems, p_values)):
+        annotation = f"{mean:.3f}"
         if p is not None:
-            plt.text(i, mean + sem + 0.02 * y_max, f"p={p:.3g}", ha="center", va="bottom", fontsize=9)
+            annotation += f"\np={p:.3g}"
+        plt.text(i, mean + sem + 0.02 * y_max, annotation, ha="center", va="bottom", fontsize=9)
 
     plt.tight_layout()
     plt.savefig(args.output)

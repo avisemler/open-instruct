@@ -6,10 +6,25 @@ negative = "no, I don't know"), runs both through the model and records
 the last-token hidden state at every decoder layer.  The mean-difference
 vector (mean_pos − mean_neg) is L2-normalised and saved per layer.
 
-Usage:
+Default behaviour (no args): fetches all HuggingFace branches of
+allenai/Olmo-3-32B-Think, computes probes for every revision, and writes
+a cosine-similarity matrix to probe_cache/allenai_Olmo-3-32B-Think/similarity_matrix.png.
+
+Single-model usage:
     python scripts/cache_probe_directions.py \
         --model_name_or_path allenai/OLMo-2-1124-7B-Instruct \
         --output_path /tmp/probe_directions.pt
+
+Multi-revision usage (explicit revisions):
+    python scripts/cache_probe_directions.py \
+        --model_name_or_path allenai/Olmo-3-32B-Think \
+        --model_revisions main step1000 step2000 step3000 \
+        --output_dir /tmp/probe_revisions/ \
+        --plot_output_path /tmp/probe_similarity_matrix.png
+
+Multi-revision usage (auto-fetch all branches):
+    python scripts/cache_probe_directions.py \
+        --model_name_or_path allenai/Olmo-3-32B-Think
 
 The output .pt file has the structure:
     {
@@ -30,7 +45,35 @@ from open_instruct.dataset_transformation import CHAT_TEMPLATES
 
 logger = logger_utils.setup_logger(__name__)
 
+_DEFAULT_MODEL = "allenai/Olmo-3-32B-Think"
+_HF_CACHE_DIR = "/workspace/.cache/huggingface"
 _DEFAULT_PROMPTS_JSON = os.path.join(os.path.dirname(__file__), "data", "awareness_probe_prompts.json")
+
+
+def _fetch_all_revisions(model_name: str) -> list[str]:
+    """Return all branch names for a HuggingFace repo, sorted lexicographically."""
+    from huggingface_hub import list_repo_refs
+
+    out = list_repo_refs(model_name)
+    branches = sorted(b.name for b in out.branches)
+    logger.info(f"Auto-fetched {len(branches)} branches from {model_name}: {branches}")
+    return branches
+
+
+def _default_output_dir(model_name: str) -> str:
+    slug = model_name.replace("/", "_")
+    return os.path.join("probe_cache", slug)
+
+
+def _clear_hf_cache() -> None:
+    """Delete the HuggingFace model cache to reclaim disk space between revisions."""
+    import shutil
+
+    if os.path.isdir(_HF_CACHE_DIR):
+        shutil.rmtree(_HF_CACHE_DIR)
+        logger.info(f"Cleared HuggingFace cache at {_HF_CACHE_DIR}")
+    else:
+        logger.info(f"HuggingFace cache directory not found, skipping: {_HF_CACHE_DIR}")
 
 
 def load_probe_prompts(path: str) -> list[dict]:
@@ -76,21 +119,14 @@ def _sanity_check(directions: dict[int, torch.Tensor], pos_hiddens: dict, neg_hi
     )
 
 
-def main(args: argparse.Namespace) -> None:
-    prompts = load_probe_prompts(args.probe_prompts_json)
-    logger.info(f"Loaded {len(prompts)} probe prompts from {args.probe_prompts_json}")
-
-    logger.info(f"Loading tokenizer from {args.model_name_or_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    if args.chat_template_name and args.chat_template_name in CHAT_TEMPLATES:
-        tokenizer.chat_template = CHAT_TEMPLATES[args.chat_template_name]
-        logger.info(f"Applied chat template: {args.chat_template_name}")
-    logger.info(f"Loading model from {args.model_name_or_path}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto"
-    )
-    model.eval()
-
+def compute_probe_directions(
+    model,
+    tokenizer,
+    prompts: list[dict],
+    model_name: str,
+    chat_template_name: str,
+) -> dict:
+    """Run the probe extraction for a loaded model and return the output dict."""
     pos_hiddens: dict[int, list[torch.Tensor]] = {}
     neg_hiddens: dict[int, list[torch.Tensor]] = {}
 
@@ -107,7 +143,6 @@ def main(args: argparse.Namespace) -> None:
                 store[layer_idx].append(h)
         logger.info(f"  {polarity}: collected activations at {len(store)} layers.")
 
-    # Compute mean-difference directions
     layer_indices = sorted(pos_hiddens.keys())
     n_layers = len(layer_indices)
     hidden_dim = pos_hiddens[layer_indices[0]][0].shape[0]
@@ -125,29 +160,196 @@ def main(args: argparse.Namespace) -> None:
 
     _sanity_check(directions, pos_hiddens, neg_hiddens)
 
-    output = {
+    return {
         "directions": directions,
         "metadata": {
-            "model": args.model_name_or_path,
+            "model": model_name,
             "n_prompts": len(prompts),
             "n_layers": n_layers,
             "hidden_dim": hidden_dim,
-            "chat_template_name": args.chat_template_name,
+            "chat_template_name": chat_template_name,
         },
     }
-    torch.save(output, args.output_path)
-    logger.info(
-        f"Saved probe directions for {n_layers} layers to {args.output_path} "
-        f"(hidden_dim={hidden_dim}, n_prompts={len(prompts)})"
-    )
+
+
+def plot_cosine_similarity_matrix(
+    all_directions: dict[str, dict[int, torch.Tensor]],
+    plot_output_path: str,
+    n_plot_layers: int = 8,
+) -> None:
+    import math
+
+    import matplotlib.pyplot as plt
+
+    revisions = list(all_directions.keys())
+    layer_indices = sorted(all_directions[revisions[0]].keys())
+
+    # Pick ~n_plot_layers evenly-spaced layers across the network depth.
+    step = max(1, len(layer_indices) // n_plot_layers)
+    plot_layers = layer_indices[::step][:n_plot_layers]
+
+    ncols = min(4, len(plot_layers))
+    nrows = math.ceil(len(plot_layers) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    rev_labels = [rev[:12] for rev in revisions]
+
+    # Pre-compute all sim matrices so we can set a shared adaptive scale.
+    sims = {}
+    for layer in plot_layers:
+        V = torch.stack([all_directions[rev][layer] for rev in revisions])
+        V_norm = V / V.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        sims[layer] = (V_norm @ V_norm.T).numpy()
+
+    all_vals = [sims[l] for l in plot_layers]
+    import numpy as np
+    vmin = float(np.min(all_vals))
+    vmax = float(np.max(all_vals))
+
+    for ax, layer in zip(axes_flat, plot_layers):
+        sim = sims[layer]
+        im = ax.imshow(sim, vmin=vmin, vmax=vmax, cmap="RdBu_r")
+        ax.set_title(f"Layer {layer}")
+        ax.set_xticks(range(len(revisions)))
+        ax.set_yticks(range(len(revisions)))
+        ax.set_xticklabels(rev_labels, rotation=90, fontsize=7)
+        ax.set_yticklabels(rev_labels, fontsize=7)
+        plt.colorbar(im, ax=ax)
+
+    for ax in axes_flat[len(plot_layers):]:
+        ax.set_visible(False)
+
+    plt.suptitle("Probe direction cosine similarity across revisions")
+    plt.tight_layout()
+    plt.savefig(plot_output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info(f"Saved similarity matrix plot to {plot_output_path}")
+
+
+def main(args: argparse.Namespace) -> None:
+    prompts = load_probe_prompts(args.probe_prompts_json)
+    logger.info(f"Loaded {len(prompts)} probe prompts from {args.probe_prompts_json}")
+
+    if args.output_path:
+        # ------------------------------------------------------------------ #
+        # Single-model mode (original behaviour).                             #
+        # ------------------------------------------------------------------ #
+        logger.info(f"Loading tokenizer from {args.model_name_or_path}...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        if args.chat_template_name and args.chat_template_name in CHAT_TEMPLATES:
+            tokenizer.chat_template = CHAT_TEMPLATES[args.chat_template_name]
+            logger.info(f"Applied chat template: {args.chat_template_name}")
+        logger.info(f"Loading model from {args.model_name_or_path}...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto"
+        )
+        model.eval()
+
+        output = compute_probe_directions(
+            model, tokenizer, prompts, args.model_name_or_path, args.chat_template_name
+        )
+        torch.save(output, args.output_path)
+        n_layers = output["metadata"]["n_layers"]
+        hidden_dim = output["metadata"]["hidden_dim"]
+        logger.info(
+            f"Saved probe directions for {n_layers} layers to {args.output_path} "
+            f"(hidden_dim={hidden_dim}, n_prompts={len(prompts)})"
+        )
+        return
+
+    # ---------------------------------------------------------------------- #
+    # Multi-revision mode: compute probes for every revision, then plot.      #
+    # ---------------------------------------------------------------------- #
+    revisions = args.model_revisions or _fetch_all_revisions(args.model_name_or_path)
+    output_dir = args.output_dir or _default_output_dir(args.model_name_or_path)
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
+
+    all_directions: dict[str, dict[int, torch.Tensor]] = {}
+    model = None
+
+    for revision in revisions:
+        safe_rev = revision.replace("/", "_")
+        cache_path = os.path.join(output_dir, f"probe_directions_{safe_rev}.pt")
+
+        if os.path.exists(cache_path):
+            logger.info(f"Loading cached directions for revision '{revision}' from {cache_path}")
+            cached = torch.load(cache_path, weights_only=False)
+            all_directions[revision] = cached["directions"]
+            continue
+
+        # Free GPU memory and HuggingFace disk cache from the previous revision.
+        if model is not None:
+            del model
+            torch.cuda.empty_cache()
+            _clear_hf_cache()
+
+        logger.info(f"Loading tokenizer from {args.model_name_or_path} at revision '{revision}'...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        if args.chat_template_name and args.chat_template_name in CHAT_TEMPLATES:
+            tokenizer.chat_template = CHAT_TEMPLATES[args.chat_template_name]
+
+        logger.info(f"Loading model at revision '{revision}'...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path, revision=revision, torch_dtype=torch.bfloat16, device_map="auto"
+        )
+        model.eval()
+
+        output = compute_probe_directions(
+            model, tokenizer, prompts, args.model_name_or_path, args.chat_template_name
+        )
+        torch.save(output, cache_path)
+        logger.info(f"Saved probe directions for revision '{revision}' to {cache_path}")
+        all_directions[revision] = output["directions"]
+
+    if model is not None:
+        del model
+        torch.cuda.empty_cache()
+
+    plot_path = args.plot_output_path or os.path.join(output_dir, "similarity_matrix.png")
+    plot_cosine_similarity_matrix(all_directions, plot_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Compute contrastive linear probe directions for evaluation awareness."
     )
-    parser.add_argument("--model_name_or_path", type=str, required=True)
-    parser.add_argument("--output_path", type=str, required=True)
+    parser.add_argument(
+        "--model_name_or_path",
+        type=str,
+        default=_DEFAULT_MODEL,
+        help=f"HuggingFace model name or local path. Defaults to {_DEFAULT_MODEL}.",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default=None,
+        help="Output .pt file path (single-model mode).",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory to cache per-revision .pt files (multi-revision mode). "
+        "Defaults to probe_cache/<model_slug>/.",
+    )
+    parser.add_argument(
+        "--model_revisions",
+        type=str,
+        nargs="+",
+        default=None,
+        help="One or more HuggingFace revision strings (branch names, tags, commit SHAs). "
+        "When omitted (and --output_path is not set), all branches are fetched automatically "
+        "via huggingface_hub.list_repo_refs.",
+    )
+    parser.add_argument(
+        "--plot_output_path",
+        type=str,
+        default=None,
+        help="Path to save the cosine-similarity matrix plot (PNG). "
+        "Defaults to <output_dir>/similarity_matrix.png when using --model_revisions.",
+    )
     parser.add_argument(
         "--probe_prompts_json",
         type=str,

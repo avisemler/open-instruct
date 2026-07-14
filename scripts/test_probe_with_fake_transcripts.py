@@ -359,12 +359,12 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name_or_path", type=str, required=True)
+    parser.add_argument("--model_name_or_path", type=str, default="allenai/OLMo-3-32B-Think")
     parser.add_argument("--probe_directions_path", type=str, required=True)
     parser.add_argument(
         "--probe_layer_indices",
         type=str,
-        default=None,
+        default='10,20,30',
         help="Comma-separated layer indices (e.g. '15,31'). Default: last third of layers.",
     )
     parser.add_argument("--chat_template_name", type=str, default="olmo_thinker")

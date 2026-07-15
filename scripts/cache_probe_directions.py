@@ -47,7 +47,6 @@ logger = logger_utils.setup_logger(__name__)
 
 _DEFAULT_MODEL = "allenai/Olmo-3-32B-Think"
 _HF_CACHE_DIR = "/workspace/.cache/huggingface"
-_DEFAULT_PROMPTS_JSON = os.path.join(os.path.dirname(__file__), "data", "awareness_probe_prompts.json")
 
 
 def _fetch_all_revisions(model_name: str) -> list[str]:
@@ -60,8 +59,8 @@ def _fetch_all_revisions(model_name: str) -> list[str]:
     return branches
 
 
-def _default_output_dir(model_name: str) -> str:
-    slug = model_name.replace("/", "_")
+def _default_output_dir(model_name: str, mode: str) -> str:
+    slug = model_name.replace("/", "_") + f"_{mode}"
     return os.path.join("probe_cache", slug)
 
 
@@ -80,7 +79,7 @@ def load_probe_prompts(path: str) -> list[dict]:
     with open(path) as f:
         prompts = json.load(f)
     for item in prompts:
-        for key in ("question", "positive", "negative"):
+        for key in ("positive", "negative"):
             if key not in item:
                 raise ValueError(f"Probe prompt missing key '{key}': {item}")
     return prompts
@@ -88,12 +87,15 @@ def load_probe_prompts(path: str) -> list[dict]:
 
 def _tokenize_messages(tokenizer, question: str, choice: str) -> list[int]:
     """Format as a complete two-turn conversation and tokenise."""
-    messages = [{"role": "user", "content": question}, {"role": "assistant", "content": choice}]
+    if question:
+        messages = [{"role": "user", "content": question}, {"role": "assistant", "content": choice}]
+    else:
+        messages = [{"role": "user", "content": choice,}]
     return tokenizer.apply_chat_template(messages, add_generation_prompt=False, return_dict=False)
 
 
 @torch.no_grad()
-def _extract_answer_hidden(token_ids: list[int], model) -> list[torch.Tensor]:
+def _extract_answer_hidden(token_ids: list[int], model, index: int) -> list[torch.Tensor]:
     """Hidden state at the answer token (position -2, just before EOS) per decoder layer.
 
     Returns a list of length n_layers, each shape (hidden_dim,).
@@ -101,7 +103,8 @@ def _extract_answer_hidden(token_ids: list[int], model) -> list[torch.Tensor]:
     """
     input_tensor = torch.tensor([token_ids], dtype=torch.long, device=model.device)
     outputs = model(input_ids=input_tensor, attention_mask=torch.ones_like(input_tensor), output_hidden_states=True)
-    return [hs[0, -3, :].float().detach().cpu() for hs in outputs.hidden_states[1:]]
+    # print the value of the token at index
+    return [hs[0, index, :].float().detach().cpu() for hs in outputs.hidden_states[1:]]
 
 
 def _sanity_check(directions: dict[int, torch.Tensor], pos_hiddens: dict, neg_hiddens: dict) -> None:
@@ -125,6 +128,7 @@ def compute_probe_directions(
     prompts: list[dict],
     model_name: str,
     chat_template_name: str,
+    mode: str,
 ) -> dict:
     """Run the probe extraction for a loaded model and return the output dict."""
     pos_hiddens: dict[int, list[torch.Tensor]] = {}
@@ -133,10 +137,15 @@ def compute_probe_directions(
     for polarity, store in [("positive", pos_hiddens), ("negative", neg_hiddens)]:
         logger.info(f"Extracting {polarity} activations ({len(prompts)} prompts)...")
         for item in prompts:
-            choice = item["positive"] if polarity == "positive" else item["negative"]
-            token_ids = _tokenize_messages(tokenizer, item["question"], choice)
-            print(tokenizer.decode(token_ids[-3]))
-            per_layer = _extract_answer_hidden(token_ids, model)
+            distinct_input = item["positive"] if polarity == "positive" else item["negative"]
+            if mode == "hua":
+                token_ids = _tokenize_messages(tokenizer, "", distinct_input)
+            elif mode == "nguyen":
+                token_ids = _tokenize_messages(tokenizer, item["question"], distinct_input)
+
+            index = -3 if mode=="hua" else -3
+            print("Decoded token at index:", tokenizer.decode(token_ids[index]))
+            per_layer = _extract_answer_hidden(token_ids, model, index)
             for layer_idx, h in enumerate(per_layer):
                 if layer_idx not in store:
                     store[layer_idx] = []
@@ -228,41 +237,22 @@ def plot_cosine_similarity_matrix(
 
 
 def main(args: argparse.Namespace) -> None:
+
+    # Set default probe prompts file based on mode
+    if args.probe_prompts_json is None:
+        if args.mode == "hua":
+            args.probe_prompts_json = os.path.join(os.path.dirname(__file__), "data", "awareness_hua_prompts.json")
+        elif args.mode == "nguyen":
+            args.probe_prompts_json = os.path.join(os.path.dirname(__file__), "data", "awareness_probe_prompts.json")
+        else:
+            raise ValueError(f"Unknown mode '{args.mode}' for default probe prompts")
+    
     prompts = load_probe_prompts(args.probe_prompts_json)
     logger.info(f"Loaded {len(prompts)} probe prompts from {args.probe_prompts_json}")
 
-    if args.output_path:
-        # ------------------------------------------------------------------ #
-        # Single-model mode (original behaviour).                             #
-        # ------------------------------------------------------------------ #
-        logger.info(f"Loading tokenizer from {args.model_name_or_path}...")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-        if args.chat_template_name and args.chat_template_name in CHAT_TEMPLATES:
-            tokenizer.chat_template = CHAT_TEMPLATES[args.chat_template_name]
-            logger.info(f"Applied chat template: {args.chat_template_name}")
-        logger.info(f"Loading model from {args.model_name_or_path}...")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto"
-        )
-        model.eval()
 
-        output = compute_probe_directions(
-            model, tokenizer, prompts, args.model_name_or_path, args.chat_template_name
-        )
-        torch.save(output, args.output_path)
-        n_layers = output["metadata"]["n_layers"]
-        hidden_dim = output["metadata"]["hidden_dim"]
-        logger.info(
-            f"Saved probe directions for {n_layers} layers to {args.output_path} "
-            f"(hidden_dim={hidden_dim}, n_prompts={len(prompts)})"
-        )
-        return
-
-    # ---------------------------------------------------------------------- #
-    # Multi-revision mode: compute probes for every revision, then plot.      #
-    # ---------------------------------------------------------------------- #
     revisions = args.model_revisions or _fetch_all_revisions(args.model_name_or_path)
-    output_dir = args.output_dir or _default_output_dir(args.model_name_or_path)
+    output_dir = args.output_dir or _default_output_dir(args.model_name_or_path, args.mode)
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
 
@@ -285,7 +275,7 @@ def main(args: argparse.Namespace) -> None:
             torch.cuda.empty_cache()
             _clear_hf_cache()
 
-        logger.info(f"Loading tokenizer from {args.model_name_or_path} at revision '{revision}'...")
+        logger.info(f"Loading tokenizer from {args.model_name_or_path}...")
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
         if args.chat_template_name and args.chat_template_name in CHAT_TEMPLATES:
             tokenizer.chat_template = CHAT_TEMPLATES[args.chat_template_name]
@@ -297,7 +287,7 @@ def main(args: argparse.Namespace) -> None:
         model.eval()
 
         output = compute_probe_directions(
-            model, tokenizer, prompts, args.model_name_or_path, args.chat_template_name
+            model, tokenizer, prompts, args.model_name_or_path, args.chat_template_name, args.mode
         )
         torch.save(output, cache_path)
         logger.info(f"Saved probe directions for revision '{revision}' to {cache_path}")
@@ -316,22 +306,24 @@ if __name__ == "__main__":
         description="Compute contrastive linear probe directions for evaluation awareness."
     )
     parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["hua", "nguyen"],
+        default="hua",
+        help="Which prompt set to use for the probe. Named after first author of the paper."
+    )
+
+    parser.add_argument(
         "--model_name_or_path",
         type=str,
         default=_DEFAULT_MODEL,
         help=f"HuggingFace model name or local path. Defaults to {_DEFAULT_MODEL}.",
     )
     parser.add_argument(
-        "--output_path",
-        type=str,
-        default=None,
-        help="Output .pt file path (single-model mode).",
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
-        help="Directory to cache per-revision .pt files (multi-revision mode). "
+        help="Directory to cache per-revision .pt files. "
         "Defaults to probe_cache/<model_slug>/.",
     )
     parser.add_argument(
@@ -340,7 +332,7 @@ if __name__ == "__main__":
         nargs="+",
         default=None,
         help="One or more HuggingFace revision strings (branch names, tags, commit SHAs). "
-        "When omitted (and --output_path is not set), all branches are fetched automatically "
+        "When omitted, all branches are fetched automatically "
         "via huggingface_hub.list_repo_refs.",
     )
     parser.add_argument(
@@ -353,7 +345,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--probe_prompts_json",
         type=str,
-        default=_DEFAULT_PROMPTS_JSON,
+        default=None,
         help="Path to JSON file with probe prompts (list of {question, positive, negative}).",
     )
     parser.add_argument(

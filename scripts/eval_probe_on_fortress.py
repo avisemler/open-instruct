@@ -52,12 +52,12 @@ _NGUYEN_SYSTEM_PROMPT = (
 
 
 def fetch_all_revisions(model_name: str) -> list[str]:
-    """Return all model branches, ordered with main first then by name."""
+    """Return all model branches, ordered with main last."""
     refs = list_repo_refs(model_name)
     revisions = sorted(branch.name for branch in refs.branches)
     if "main" in revisions:
         revisions.remove("main")
-        revisions.insert(0, "main")
+        revisions.append("main")
     logger.info(f"Fetched {len(revisions)} revisions from {model_name}: {revisions}")
     return revisions
 
@@ -93,7 +93,9 @@ def prompt_to_token_ids(prompt: str, tokenizer, apply_nguyen_transform: bool) ->
 
     messages = [{"role": "user", "content": prompt}]
     try:
-        return tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_dict=False)[:-3]
+        tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_dict=False)[:-3]
+        print("Formatted prompt for scoring:\n", tokenizer.decode(tokens))
+        return tokens
     except Exception:
         return tokenizer.encode(prompt)
 
@@ -130,26 +132,6 @@ def mean(values: Iterable[float]) -> float:
     return sum(values) / len(values)
 
 
-def summarize_scores(
-    adversarial_scores: dict[int, list[float]], benign_scores: dict[int, list[float]]
-) -> dict[str, dict[str, float]]:
-    """Compute paired gaps and prompt-type AUCs for every probe layer."""
-    summary = {}
-    for layer in sorted(adversarial_scores):
-        adversarial = adversarial_scores[layer]
-        benign = benign_scores[layer]
-        labels = [1] * len(adversarial) + [0] * len(benign)
-        scores = adversarial + benign
-        summary[str(layer)] = {
-            "adversarial_mean": mean(adversarial),
-            "benign_mean": mean(benign),
-            "mean_gap": mean(a - b for a, b in zip(adversarial, benign)),
-            "pairwise_adversarial_higher_rate": mean(a > b for a, b in zip(adversarial, benign)),
-            "auc_roc": roc_auc_score(labels, scores),
-        }
-    return summary
-
-
 def score_revision(
     examples: list[dict[str, str]], model, tokenizer, directions: dict[int, torch.Tensor], args: argparse.Namespace
 ) -> dict[str, dict[str, float]]:
@@ -166,7 +148,7 @@ def score_revision(
                 score_store[layer].append(torch.dot(per_layer[layer], direction.float()).item())
         if (index + 1) % 25 == 0:
             logger.info(f"  Processed {index + 1}/{len(examples)} Fortress pairs")
-    return summarize_scores(adversarial_scores, benign_scores)
+    return adversarial_scores, benign_scores
 
 
 def clear_hf_cache() -> None:
@@ -189,31 +171,32 @@ def write_results(path: str, results: dict) -> None:
 
 
 def plot_results(results: dict, plot_path: str, plot_layers: str | None) -> None:
-    """Plot per-revision adversarial-minus-benign mean probe score gaps."""
+    """Plot with revision on the x-axis and 2 lines, for adversarial and benign mean probe scores."""
     revisions = results["completed_revisions"]
-    if not revisions:
-        return
-    all_layers = sorted(int(layer) for layer in results["scores_by_revision"][revisions[0]])
-    layers = [int(layer) for layer in plot_layers.split(",")] if plot_layers else all_layers
-    missing = set(layers) - set(all_layers)
-    if missing:
-        raise ValueError(f"Plot layers are absent from results: {sorted(missing)}")
 
-    figure, axis = plt.subplots(figsize=(max(8, len(revisions) * 0.8), 5))
-    for layer in layers:
-        gaps = [results["scores_by_revision"][revision][str(layer)]["mean_gap"] for revision in revisions]
-        axis.plot(revisions, gaps, marker="o", linewidth=1.5, label=f"Layer {layer}")
-    axis.axhline(0, color="black", linewidth=0.8, linestyle="--")
-    axis.set_xlabel("Model revision")
-    axis.set_ylabel("Adversarial − benign mean probe score")
-    axis.set_title("Fortress evaluation-awareness probe scores across revisions")
-    axis.tick_params(axis="x", rotation=45)
-    axis.legend(ncol=min(4, len(layers)), fontsize=8)
-    figure.tight_layout()
-    figure.savefig(plot_path, dpi=150)
-    plt.close(figure)
-    logger.info(f"Saved score-tracking plot to {plot_path}")
+    layer_to_plot = 10
 
+    # Accumulate mean scores for each revision and the specified layer
+    adversarial_means = []
+    benign_means = []
+    for revision in revisions:
+        adversarial_scores = results["scores_by_revision"][revision]["adversarial"]
+        benign_scores = results["scores_by_revision"][revision]["benign"]
+
+        adversarial_means.append(mean(adversarial_scores[layer_to_plot]))
+        benign_means.append(mean(benign_scores[layer_to_plot]))
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(revisions, adversarial_means, label="Adversarial Mean Score", marker='o')
+    plt.plot(revisions, benign_means, label="Benign Mean Score", marker='o')
+    plt.xlabel("Model Revision")
+    plt.ylabel(f"Mean Probe Score (Layer {layer_to_plot})")
+    plt.title("Fortress Probe Scores Across Model Revisions")
+    plt.xticks(rotation=45)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plot_path)
+    logger.info(f"Saved plot to {plot_path}")
 
 def main(args: argparse.Namespace) -> None:
     examples = load_fortress_dataset(args.dataset_name, args.max_examples)
@@ -251,7 +234,7 @@ def main(args: argparse.Namespace) -> None:
         directions = select_directions(probe_data["directions"], args.probe_layer_indices)
 
         logger.info(f"Loading model revision '{revision}'")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, revision=revision)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
         if args.chat_template_name and args.chat_template_name in CHAT_TEMPLATES:
             tokenizer.chat_template = CHAT_TEMPLATES[args.chat_template_name]
         model = AutoModelForCausalLM.from_pretrained(
@@ -259,7 +242,12 @@ def main(args: argparse.Namespace) -> None:
         )
         model.eval()
 
-        results["scores_by_revision"][revision] = score_revision(examples, model, tokenizer, directions, args)
+        adversarial_scores, benign_scores = score_revision(examples, model, tokenizer, directions, args)
+        results["scores_by_revision"][revision] = {
+            "adversarial": adversarial_scores,
+            "benign": benign_scores,
+        }
+
         results["completed_revisions"].append(revision)
         write_results(args.output_path, results)
         logger.info(f"Saved results through revision '{revision}' to {args.output_path}")
@@ -269,12 +257,6 @@ def main(args: argparse.Namespace) -> None:
         clear_hf_cache()
 
     plot_results(results, args.plot_path, args.plot_layer_indices)
-    print("\nFortress probe-score summary (adversarial − benign mean gap):")
-    for revision in results["completed_revisions"]:
-        gaps = results["scores_by_revision"][revision]
-        formatted = ", ".join(f"L{layer}={values['mean_gap']:+.4f}" for layer, values in gaps.items())
-        print(f"  {revision}: {formatted}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -289,13 +271,13 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated layers to score. Defaults to every layer in each probe file.",
     )
-    parser.add_argument("--max_examples", type=int, default=None)
+    parser.add_argument("--max_examples", type=int, default=50)
     parser.add_argument("--max_tokens", type=int, default=2048)
     parser.add_argument("--pooling", choices=["mean", "last"], default="mean")
     parser.add_argument(
         "--apply_nguyen_transform",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Wrap each prompt in the Nguyen testing/deployment classification prompt.",
     )
     parser.add_argument("--chat_template_name", default="olmo_thinker")

@@ -133,22 +133,39 @@ def mean(values: Iterable[float]) -> float:
 
 
 def score_revision(
-    examples: list[dict[str, str]], model, tokenizer, directions: dict[int, torch.Tensor], args: argparse.Namespace
-) -> dict[str, dict[str, float]]:
+    examples: list[dict[str, str]],
+    model,
+    tokenizer,
+    directions: dict[int, torch.Tensor],
+    args: argparse.Namespace,
+    frozen_directions: dict[int, torch.Tensor] | None = None,
+) -> tuple:
     """Score both Fortress prompt types for a loaded model revision."""
     adversarial_scores = {layer: [] for layer in directions}
     benign_scores = {layer: [] for layer in directions}
+    adversarial_frozen_scores = {layer: [] for layer in frozen_directions} if frozen_directions is not None else None
+    benign_frozen_scores = {layer: [] for layer in frozen_directions} if frozen_directions is not None else None
     for index, example in enumerate(examples):
-        for prompt_type, score_store in (("adversarial_prompt", adversarial_scores), ("benign_prompt", benign_scores)):
+        for prompt_type, score_store, frozen_store in (
+            ("adversarial_prompt", adversarial_scores, adversarial_frozen_scores),
+            ("benign_prompt", benign_scores, benign_frozen_scores),
+        ):
             token_ids = prompt_to_token_ids(example[prompt_type], tokenizer, args.apply_nguyen_transform)
             per_layer = extract_hidden_states(token_ids, model, args.max_tokens, args.pooling)
             for layer, direction in directions.items():
                 if layer >= len(per_layer):
                     raise ValueError(f"Probe layer {layer} is unavailable; model has {len(per_layer)} decoder layers")
                 score_store[layer].append(torch.dot(per_layer[layer], direction.float()).item())
+            if frozen_directions is not None:
+                for layer, direction in frozen_directions.items():
+                    if layer >= len(per_layer):
+                        raise ValueError(
+                            f"Frozen probe layer {layer} is unavailable; model has {len(per_layer)} decoder layers"
+                        )
+                    frozen_store[layer].append(torch.dot(per_layer[layer], direction.float()).item())
         if (index + 1) % 25 == 0:
             logger.info(f"  Processed {index + 1}/{len(examples)} Fortress pairs")
-    return adversarial_scores, benign_scores
+    return adversarial_scores, benign_scores, adversarial_frozen_scores, benign_frozen_scores
 
 
 def clear_hf_cache() -> None:
@@ -170,33 +187,59 @@ def write_results(path: str, results: dict) -> None:
     os.replace(temporary_path, path)
 
 
-def plot_results(results: dict, plot_path: str, plot_layers: str | None) -> None:
+def plot_results(results: dict, plot_path: str, layer_to_plot: int) -> None:
     """Plot with revision on the x-axis and 2 lines, for adversarial and benign mean probe scores."""
     revisions = results["completed_revisions"]
-
-    layer_to_plot = 10
 
     # Accumulate mean scores for each revision and the specified layer
     adversarial_means = []
     benign_means = []
+    adversarial_frozen_means = []
+    benign_frozen_means = []
     for revision in revisions:
         adversarial_scores = results["scores_by_revision"][revision]["adversarial"]
         benign_scores = results["scores_by_revision"][revision]["benign"]
 
+        if type(list(adversarial_scores.keys())[0]) is str:
+            layer_to_plot = str(layer_to_plot)
         adversarial_means.append(mean(adversarial_scores[layer_to_plot]))
         benign_means.append(mean(benign_scores[layer_to_plot]))
+
+        adversarial_frozen = results["scores_by_revision"][revision].get("adversarial_frozen")
+        benign_frozen = results["scores_by_revision"][revision].get("benign_frozen")
+        if adversarial_frozen is not None and benign_frozen is not None:
+            adversarial_frozen_means.append(mean(adversarial_frozen[layer_to_plot]))
+            benign_frozen_means.append(mean(benign_frozen[layer_to_plot]))
+
+    frozen_revision = results.get("frozen_probe_revision", revisions[0] if revisions else "first")
 
     plt.figure(figsize=(10, 6))
     plt.plot(revisions, adversarial_means, label="Adversarial Mean Score", marker='o')
     plt.plot(revisions, benign_means, label="Benign Mean Score", marker='o')
+    if adversarial_frozen_means:
+        frozen_revisions = revisions[: len(adversarial_frozen_means)]
+        plt.plot(
+            frozen_revisions,
+            adversarial_frozen_means,
+            label=f"Adversarial Mean Score (Frozen Probe @ {frozen_revision})",
+            marker='s',
+            linestyle='--',
+        )
+        plt.plot(
+            frozen_revisions,
+            benign_frozen_means,
+            label=f"Benign Mean Score (Frozen Probe @ {frozen_revision})",
+            marker='s',
+            linestyle='--',
+        )
     plt.xlabel("Model Revision")
     plt.ylabel(f"Mean Probe Score (Layer {layer_to_plot})")
-    plt.title("Fortress Probe Scores Across Model Revisions")
+    plt.title(f"Fortress Probe Scores: Layer {layer_to_plot} over RLVR")
     plt.xticks(rotation=45)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(plot_path)
-    logger.info(f"Saved plot to {plot_path}")
+    plt.savefig(plot_path.replace(".png", f"_layer{layer_to_plot}.png"))
+    logger.info(f"Saved plot to {plot_path.replace('.png', f'_layer{layer_to_plot}.png')}")
 
 def main(args: argparse.Namespace) -> None:
     examples = load_fortress_dataset(args.dataset_name, args.max_examples)
@@ -217,6 +260,21 @@ def main(args: argparse.Namespace) -> None:
             "completed_revisions": [],
             "scores_by_revision": {},
         }
+
+    # Load probe directions from the first revision and keep them frozen across all revisions.
+    first_revision = revisions[0]
+    frozen_probe_path = os.path.join(
+        args.probe_directions_dir, f"probe_directions_{first_revision.replace('/', '_')}.pt"
+    )
+    if not os.path.exists(frozen_probe_path):
+        raise FileNotFoundError(
+            f"Missing probe directions for first revision '{first_revision}': {frozen_probe_path}. "
+            "Run scripts/cache_probe_directions.py first or pass --probe_directions_dir."
+        )
+    logger.info(f"Loading frozen probe directions from first revision '{first_revision}'")
+    frozen_probe_data = torch.load(frozen_probe_path, weights_only=True)
+    frozen_directions = select_directions(frozen_probe_data["directions"], args.probe_layer_indices)
+    results["frozen_probe_revision"] = first_revision
 
     for revision in revisions:
         if revision in results["completed_revisions"]:
@@ -242,10 +300,14 @@ def main(args: argparse.Namespace) -> None:
         )
         model.eval()
 
-        adversarial_scores, benign_scores = score_revision(examples, model, tokenizer, directions, args)
+        adversarial_scores, benign_scores, adversarial_frozen_scores, benign_frozen_scores = score_revision(
+            examples, model, tokenizer, directions, args, frozen_directions=frozen_directions
+        )
         results["scores_by_revision"][revision] = {
             "adversarial": adversarial_scores,
             "benign": benign_scores,
+            "adversarial_frozen": adversarial_frozen_scores,
+            "benign_frozen": benign_frozen_scores,
         }
 
         results["completed_revisions"].append(revision)
@@ -256,7 +318,8 @@ def main(args: argparse.Namespace) -> None:
         torch.cuda.empty_cache()
         clear_hf_cache()
 
-    plot_results(results, args.plot_path, args.plot_layer_indices)
+    for layer in range(0, 64):
+        plot_results(results, args.plot_path, layer)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
